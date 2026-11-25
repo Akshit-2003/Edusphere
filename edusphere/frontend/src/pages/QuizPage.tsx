@@ -147,7 +147,7 @@ export default function QuizPage({ setPage }: { setPage: (p: Page) => void }) {
         body: JSON.stringify({ user_id: userId, front: question.q, back: question.opts[question.correct], subject: quiz?.subject ?? 'General' }),
       })))
       setPage('flashcards')
-    } catch (error) {
+    } catch {
       setError('Flashcards could not be generated. Please try again.')
     }
   }

@@ -1,191 +1,358 @@
-import { useState, useRef } from 'react'
-import { Upload, FileText, Check, Bot, CreditCard, HelpCircle, Share2 } from 'lucide-react'
-import { api, currentUserId } from '../lib/api'
+import { useRef, useState } from 'react'
+import type { ChangeEvent, DragEvent, KeyboardEvent } from 'react'
+import {
+  Check,
+  CheckCircle2,
+  FileText,
+  FolderOpen,
+  LoaderCircle,
+  RefreshCw,
+  ShieldCheck,
+  Sparkles,
+  Upload,
+  X,
+} from 'lucide-react'
+import { ApiError, api, currentUserId } from '../lib/api'
 import type { Page } from '../types'
 
-const steps = [
-  { label: 'Extracting content', done: true },
-  { label: 'Generating summary', done: true },
-  { label: 'Finding key concepts', done: true },
-  { label: 'Creating flashcards', done: false },
-]
+type ImportPhase = 'ready' | 'processing' | 'success'
 
-const keyConceptsData = ['TCP Three-Way Handshake', 'Congestion Control', 'Sliding Window', 'Flow Control', 'Error Detection', 'Retransmission']
+interface ImportResult {
+  document_id: number | null
+  document_title: string
+  page_count: number
+  extracted_characters: number
+  summary: string
+  key_concepts: string[]
+  flashcards_created: number
+  preview: string
+}
 
-export default function PDFUploadPage({ setPage }: { setPage: (page: Page) => void }) {
-  const [phase, setPhase] = useState<'upload' | 'processing' | 'done'>('upload')
-  const [drag, setDrag] = useState(false)
+interface PDFUploadPageProps {
+  setPage: (page: Page) => void
+  onOpenDocument: (id: number) => void
+}
+
+const MAX_FILE_BYTES = 15 * 1024 * 1024
+
+const formatFileSize = (bytes: number) => {
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
+export default function PDFUploadPage({ setPage, onOpenDocument }: PDFUploadPageProps) {
+  const inputRef = useRef<HTMLInputElement>(null)
+  const [file, setFile] = useState<File | null>(null)
+  const [isDragging, setIsDragging] = useState(false)
+  const [phase, setPhase] = useState<ImportPhase>('ready')
   const [progress, setProgress] = useState(0)
-  const [fileName, setFileName] = useState('Imported study document')
-  const [savedDocument, setSavedDocument] = useState(false)
   const [error, setError] = useState('')
-  const fileRef = useRef<HTMLInputElement>(null)
+  const [result, setResult] = useState<ImportResult | null>(null)
+  const [options, setOptions] = useState({
+    summary: true,
+    flashcards: true,
+    workspaceNote: true,
+  })
 
-  const startProcess = (file: File) => {
-    if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) {
-      setError('Please choose a PDF file.')
-      return
-    }
-    if (file.size > 5 * 1024 * 1024) {
-      setError('Choose a PDF smaller than 5 MB for this import.')
-      return
-    }
+  const chooseFile = (candidate: File | undefined) => {
     setError('')
-    setSavedDocument(false)
+    setResult(null)
+    setPhase('ready')
+
+    if (!candidate) return
+
+    const isPdf = candidate.type === 'application/pdf' || candidate.name.toLowerCase().endsWith('.pdf')
+    if (!isPdf) {
+      setFile(null)
+      setError('Please select a PDF file. Other file types are not supported here.')
+      return
+    }
+    if (candidate.size > MAX_FILE_BYTES) {
+      setFile(null)
+      setError('This PDF is larger than 15 MB. Please choose a smaller document.')
+      return
+    }
+
+    setFile(candidate)
+  }
+
+  const handleFileChange = (event: ChangeEvent<HTMLInputElement>) => {
+    chooseFile(event.target.files?.[0])
+  }
+
+  const handleDrop = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault()
+    setIsDragging(false)
+    chooseFile(event.dataTransfer.files?.[0])
+  }
+
+  const handleUploadZoneKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault()
+      inputRef.current?.click()
+    }
+  }
+
+  const resetImport = () => {
+    setFile(null)
+    setError('')
+    setResult(null)
     setProgress(0)
-    setFileName(file.name)
+    setPhase('ready')
+    if (inputRef.current) inputRef.current.value = ''
+  }
+
+  const importPdf = async () => {
+    if (!file) {
+      setError('Choose a PDF first, then start the import.')
+      return
+    }
+
+    const userId = currentUserId()
+    if (!userId) {
+      setError('Your session could not be found. Please sign in again and retry.')
+      return
+    }
+
+    setError('')
+    setProgress(8)
     setPhase('processing')
-    let p = 0
-    const iv = window.setInterval(async () => {
-      p += 4
-      setProgress(p)
-      if (p >= 100) {
-        window.clearInterval(iv)
-        const userId = currentUserId()
-        if (!userId) {
-          setError('Your session expired. Please sign in again.')
-          setPhase('upload')
-          return
-        }
-        try {
-          await api('/documents/', {
-            method: 'POST',
-            body: JSON.stringify({
-              owner_id: userId,
-              title: file.name,
-              folder: 'PDF Imports',
-              content: `PDF import: ${file.name}\nFile size: ${Math.ceil(file.size / 1024)} KB\n\nThis document was added from the PDF importer and is ready for study notes, flashcards, and quiz preparation.`,
-            }),
-          })
-          setSavedDocument(true)
-          setPhase('done')
-        } catch {
-          setError('The PDF reference could not be saved to your workspace. Please try again.')
-          setPhase('upload')
-        }
-      }
-    }, 80)
+
+    const progressTimer = window.setInterval(() => {
+      setProgress((current) => Math.min(90, current + Math.max(2, Math.round((90 - current) / 5))))
+    }, 420)
+
+    try {
+      const formData = new FormData()
+      formData.append('file', file)
+      formData.append('user_id', String(userId))
+      formData.append('generate_summary', String(options.summary))
+      formData.append('generate_flashcards', String(options.flashcards))
+      formData.append('save_as_note', String(options.workspaceNote))
+
+      const imported = await api<ImportResult>('/pdf/import', {
+        method: 'POST',
+        body: formData,
+      })
+
+      window.clearInterval(progressTimer)
+      setProgress(100)
+      setResult(imported)
+      setPhase('success')
+    } catch (uploadError) {
+      window.clearInterval(progressTimer)
+      setProgress(0)
+      setPhase('ready')
+      setError(uploadError instanceof ApiError ? uploadError.message : 'The PDF could not be imported. Please check your connection and try again.')
+    }
   }
 
-  if (phase === 'upload') {
+  const processingLabel = progress < 35
+    ? 'Uploading your PDF securely…'
+    : progress < 78
+      ? 'Reading pages and extracting useful text…'
+      : 'Creating your study material…'
+
+  if (phase === 'success' && result) {
     return (
-      <div className="p-6 max-w-2xl mx-auto page-enter">
-        <div className="mb-8">
-          <h1 className="text-2xl font-heading font-bold" style={{ color: 'var(--foreground)' }}>PDF AI Processing</h1>
-          <p className="text-sm mt-0.5" style={{ color: 'var(--muted-foreground)' }}>Upload a PDF and let AI generate summaries, flashcards, and quizzes</p>
-        </div>
-
-        <div
-          onClick={() => fileRef.current?.click()}
-          onDragOver={e => { e.preventDefault(); setDrag(true) }}
-          onDragLeave={() => setDrag(false)}
-          onDrop={e => { e.preventDefault(); setDrag(false); const file = e.dataTransfer.files[0]; if (file) startProcess(file) }}
-          className="border-2 border-dashed rounded-2xl p-16 text-center cursor-pointer transition-all"
-          style={{
-            borderColor: drag ? 'var(--primary)' : 'var(--border)',
-            background: drag ? 'var(--secondary-bg)' : 'var(--card)',
-          }}
-        >
-          <div className="w-16 h-16 rounded-2xl flex items-center justify-center mx-auto mb-4" style={{ background: 'var(--secondary-bg)' }}>
-            <Upload size={28} style={{ color: 'var(--primary)' }} />
-          </div>
-          <h3 className="font-heading font-bold text-lg mb-2" style={{ color: 'var(--foreground)' }}>Drop your PDF here</h3>
-          <p className="text-sm mb-6" style={{ color: 'var(--muted-foreground)' }}>or click to browse files</p>
-          <button
-            className="px-6 py-2.5 rounded-lg text-sm font-medium transition-all hover:opacity-90"
-            style={{ background: 'var(--primary)', color: '#fff' }}
-            onClick={e => { e.stopPropagation(); fileRef.current?.click() }}
-          >
-            Browse Files
-          </button>
-          <p className="text-xs mt-4" style={{ color: 'var(--muted-foreground)' }}>Supports PDF up to 5MB</p>
-          <input ref={fileRef} type="file" accept="application/pdf,.pdf" className="hidden" onChange={event => { const file = event.target.files?.[0]; if (file) startProcess(file); event.currentTarget.value = '' }} />
-        </div>
-        {error && <p className="mt-4 rounded-lg px-3 py-2 text-sm" style={{ background: '#ef444415', color: '#dc2626' }}>{error}</p>}
-      </div>
-    )
-  }
-
-  if (phase === 'processing') {
-    return (
-      <div className="p-6 max-w-lg mx-auto flex flex-col items-center justify-center min-h-96 page-enter">
-        <div className="w-20 h-20 rounded-2xl flex items-center justify-center mb-6" style={{ background: 'var(--secondary-bg)' }}>
-          <div className="w-10 h-10 border-3 border-primary border-t-transparent rounded-full animate-spin" style={{ borderWidth: 3, borderColor: 'var(--primary)', borderTopColor: 'transparent' }} />
-        </div>
-        <h2 className="font-heading font-bold text-xl mb-2" style={{ color: 'var(--foreground)' }}>Processing your PDF...</h2>
-        <p className="text-sm mb-8" style={{ color: 'var(--muted-foreground)' }}>{fileName}</p>
-
-        <div className="w-full max-w-xs mb-6">
-          <div className="h-2 rounded-full overflow-hidden mb-2" style={{ background: 'var(--muted)' }}>
-            <div className="h-full rounded-full transition-all duration-300" style={{ width: `${progress}%`, background: 'var(--primary)' }} />
-          </div>
-          <div className="text-xs text-center font-mono" style={{ color: 'var(--muted-foreground)' }}>{progress}%</div>
-        </div>
-
-        <div className="w-full max-w-xs space-y-3">
-          {steps.map((s, i) => (
-            <div key={s.label} className="flex items-center gap-3">
-              <div className={`w-5 h-5 rounded-full flex items-center justify-center shrink-0 ${i < Math.floor(progress / 25) ? 'bg-green-500' : 'border-2'}`} style={{ borderColor: 'var(--border)' }}>
-                {i < Math.floor(progress / 25) && <Check size={11} className="text-white" />}
+      <main className="min-h-full px-4 py-6 sm:px-6 lg:px-8">
+        <div className="mx-auto max-w-5xl space-y-6">
+          <section className="overflow-hidden rounded-3xl border border-emerald-200/70 bg-gradient-to-br from-emerald-50 via-[var(--bg-card)] to-sky-50 p-6 shadow-[0_18px_55px_-32px_rgba(16,185,129,0.55)] dark:border-emerald-800/60 dark:from-emerald-950/35 dark:to-sky-950/20 sm:p-8">
+            <div className="flex flex-col gap-5 sm:flex-row sm:items-start sm:justify-between">
+              <div className="flex gap-4">
+                <div className="grid h-12 w-12 shrink-0 place-items-center rounded-2xl bg-emerald-500 text-white shadow-lg shadow-emerald-500/25">
+                  <CheckCircle2 size={25} />
+                </div>
+                <div>
+                  <p className="text-sm font-semibold text-emerald-700 dark:text-emerald-300">Import complete</p>
+                  <h1 className="mt-1 break-words text-2xl font-bold tracking-tight text-[var(--text-primary)]">{result.document_title}</h1>
+                  <p className="mt-2 text-sm text-[var(--text-secondary)]">Your material is ready to review, organise, and continue studying.</p>
+                </div>
               </div>
-              <span className="text-sm" style={{ color: i < Math.floor(progress / 25) ? 'var(--foreground)' : 'var(--muted-foreground)' }}>{s.label}</span>
+              <button type="button" onClick={resetImport} className="inline-flex items-center justify-center gap-2 rounded-xl border border-[var(--border)] bg-[var(--bg-card)] px-4 py-2.5 text-sm font-semibold text-[var(--text-primary)] transition hover:-translate-y-0.5 hover:border-indigo-300 hover:shadow-sm">
+                <RefreshCw size={16} /> Import another
+              </button>
             </div>
-          ))}
+
+            <div className="mt-7 grid gap-3 sm:grid-cols-3">
+              <div className="rounded-2xl border border-white/80 bg-white/70 p-4 dark:border-white/10 dark:bg-slate-950/20">
+                <p className="text-xs font-medium uppercase tracking-wider text-[var(--text-muted)]">Pages read</p>
+                <p className="mt-1 text-2xl font-bold text-[var(--text-primary)]">{result.page_count}</p>
+              </div>
+              <div className="rounded-2xl border border-white/80 bg-white/70 p-4 dark:border-white/10 dark:bg-slate-950/20">
+                <p className="text-xs font-medium uppercase tracking-wider text-[var(--text-muted)]">Text extracted</p>
+                <p className="mt-1 text-2xl font-bold text-[var(--text-primary)]">{result.extracted_characters.toLocaleString()}</p>
+              </div>
+              <div className="rounded-2xl border border-white/80 bg-white/70 p-4 dark:border-white/10 dark:bg-slate-950/20">
+                <p className="text-xs font-medium uppercase tracking-wider text-[var(--text-muted)]">Flashcards made</p>
+                <p className="mt-1 text-2xl font-bold text-[var(--text-primary)]">{result.flashcards_created}</p>
+              </div>
+            </div>
+          </section>
+
+          <section className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_280px]">
+            <article className="rounded-3xl border border-[var(--border)] bg-[var(--bg-card)] p-5 shadow-sm sm:p-7">
+              <div className="flex items-center gap-2 text-[var(--text-primary)]">
+                <Sparkles size={19} className="text-violet-500" />
+                <h2 className="font-semibold">Study preview</h2>
+              </div>
+              {result.summary && (
+                <div className="mt-5 rounded-2xl border border-violet-100 bg-violet-50/70 p-4 text-sm leading-6 text-[var(--text-secondary)] dark:border-violet-900/60 dark:bg-violet-950/25">
+                  <p className="mb-1 font-semibold text-violet-800 dark:text-violet-200">AI summary</p>
+                  <p>{result.summary}</p>
+                </div>
+              )}
+              <p className="mt-5 whitespace-pre-wrap text-sm leading-7 text-[var(--text-secondary)]">{result.preview || 'The document has been saved and is ready in your workspace.'}</p>
+              {result.key_concepts.length > 0 && (
+                <div className="mt-6">
+                  <p className="text-sm font-semibold text-[var(--text-primary)]">Key concepts</p>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {result.key_concepts.map((concept) => (
+                      <span key={concept} className="rounded-full border border-indigo-100 bg-indigo-50 px-3 py-1.5 text-xs font-semibold text-indigo-700 dark:border-indigo-900/60 dark:bg-indigo-950/30 dark:text-indigo-200">{concept}</span>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </article>
+
+            <aside className="flex flex-col justify-between rounded-3xl border border-[var(--border)] bg-[var(--bg-card)] p-5 shadow-sm">
+              <div>
+                <div className="grid h-11 w-11 place-items-center rounded-2xl bg-indigo-100 text-indigo-600 dark:bg-indigo-950/60 dark:text-indigo-300">
+                  <FolderOpen size={21} />
+                </div>
+                <h2 className="mt-4 font-semibold text-[var(--text-primary)]">Keep learning</h2>
+                <p className="mt-2 text-sm leading-6 text-[var(--text-secondary)]">Open the imported note or continue from your workspace.</p>
+              </div>
+              <div className="mt-6 space-y-3">
+                {result.document_id && (
+                  <button type="button" onClick={() => onOpenDocument(result.document_id!)} className="flex w-full items-center justify-center gap-2 rounded-xl bg-indigo-600 px-4 py-3 text-sm font-semibold text-white shadow-md shadow-indigo-500/20 transition hover:-translate-y-0.5 hover:bg-indigo-700">
+                    <FileText size={16} /> Open imported note
+                  </button>
+                )}
+                <button type="button" onClick={() => setPage(result.flashcards_created ? 'flashcards' : 'workspace')} className="flex w-full items-center justify-center gap-2 rounded-xl border border-[var(--border)] px-4 py-3 text-sm font-semibold text-[var(--text-primary)] transition hover:-translate-y-0.5 hover:border-indigo-300 hover:bg-indigo-50/60 dark:hover:bg-indigo-950/20">
+                  {result.flashcards_created ? 'Review flashcards' : 'Open workspace'}
+                </button>
+              </div>
+            </aside>
+          </section>
         </div>
-      </div>
+      </main>
     )
   }
 
   return (
-    <div className="p-6 max-w-3xl mx-auto page-enter">
-      <div className="flex items-center gap-3 mb-6">
-        <div className="w-10 h-10 rounded-xl flex items-center justify-center" style={{ background: 'var(--secondary-bg)' }}>
-          <FileText size={20} style={{ color: 'var(--primary)' }} />
-        </div>
-        <div>
-          <h1 className="font-heading font-bold text-xl" style={{ color: 'var(--foreground)' }}>{fileName} — Import complete</h1>
-          <p className="text-sm" style={{ color: 'var(--muted-foreground)' }}>{savedDocument ? 'Saved to your PDF Imports workspace' : 'Processing complete'}</p>
-        </div>
-      </div>
-
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-6">
-        {[
-          { icon: Bot, label: 'Summary', color: '#4f46e5', action: () => document.getElementById('pdf-summary')?.scrollIntoView({ behavior: 'smooth' }) },
-          { icon: FileText, label: 'Key Concepts', color: '#8b5cf6', action: () => document.getElementById('pdf-summary')?.scrollIntoView({ behavior: 'smooth' }) },
-          { icon: CreditCard, label: 'Open Flashcards', color: '#10b981', action: () => setPage('flashcards') },
-          { icon: HelpCircle, label: 'Open Quiz', color: '#f59e0b', action: () => setPage('quiz') },
-          { icon: Share2, label: 'Knowledge Graph', color: '#3b82f6', action: () => setPage('knowledge-graph') },
-        ].map(({ icon: Icon, label, color, action }) => (
-          <button key={label} onClick={action} className="flex items-center gap-3 p-4 rounded-xl border text-left hover:border-primary/50 transition-all" style={{ background: 'var(--card)', borderColor: 'var(--border)' }}>
-            <div className="w-9 h-9 rounded-lg flex items-center justify-center" style={{ background: `${color}15` }}>
-              <Icon size={18} style={{ color }} />
+    <main className="min-h-full px-4 py-6 sm:px-6 lg:px-8">
+      <div className="mx-auto max-w-5xl">
+        <section className="overflow-hidden rounded-3xl border border-[var(--border)] bg-[var(--bg-card)] shadow-[0_20px_60px_-42px_rgba(79,70,229,0.55)]">
+          <div className="border-b border-[var(--border)] bg-gradient-to-r from-indigo-50 via-violet-50/70 to-sky-50 px-6 py-8 dark:from-indigo-950/30 dark:via-violet-950/20 dark:to-sky-950/20 sm:px-8">
+            <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <div className="inline-flex items-center gap-2 rounded-full border border-indigo-200 bg-white/75 px-3 py-1 text-xs font-semibold text-indigo-700 dark:border-indigo-800 dark:bg-indigo-950/50 dark:text-indigo-200">
+                  <Sparkles size={14} /> AI-powered study import
+                </div>
+                <h1 className="mt-4 text-3xl font-bold tracking-tight text-[var(--text-primary)]">Turn a PDF into study material</h1>
+                <p className="mt-2 max-w-2xl text-sm leading-6 text-[var(--text-secondary)]">Upload your lecture slides, reading, or handout. EduSphere extracts the text and can organise it into a workspace note, summary, and revision flashcards.</p>
+              </div>
+              <div className="hidden h-16 w-16 place-items-center rounded-3xl bg-white/80 text-indigo-600 shadow-sm dark:bg-slate-900/70 sm:grid">
+                <FileText size={30} />
+              </div>
             </div>
-            <span className="text-sm font-medium" style={{ color: 'var(--foreground)' }}>{label}</span>
-          </button>
-        ))}
-        <button onClick={() => setPhase('upload')} className="flex items-center gap-3 p-4 rounded-xl border cursor-pointer hover:border-primary/50 transition-all" style={{ background: 'var(--card)', borderColor: 'var(--border)' }}>
-          <div className="w-9 h-9 rounded-lg flex items-center justify-center" style={{ background: '#ef444415' }}>
-            <Upload size={18} style={{ color: '#ef4444' }} />
           </div>
-          <span className="text-sm font-medium" style={{ color: 'var(--foreground)' }}>Upload Another</span>
-        </button>
-      </div>
 
-      {/* Summary */}
-      <div id="pdf-summary" className="rounded-xl border p-6 mb-4" style={{ background: 'var(--card)', borderColor: 'var(--border)' }}>
-        <h3 className="font-heading font-semibold mb-3" style={{ color: 'var(--foreground)' }}>AI Summary</h3>
-        <p className="text-sm leading-relaxed mb-4" style={{ color: 'var(--foreground)', opacity: 0.85 }}>
-          This lecture covers TCP's connection-oriented nature and reliability mechanisms. Key topics include the three-way handshake for connection establishment, congestion control algorithms (Slow Start, AIMD), flow control via sliding windows, and error detection through checksums and ACK-based retransmission.
-        </p>
-        <div>
-          <div className="text-xs font-semibold uppercase tracking-wider mb-2" style={{ color: 'var(--muted-foreground)' }}>Key Concepts</div>
-          <div className="flex flex-wrap gap-2">
-            {keyConceptsData.map(c => (
-              <span key={c} className="text-xs px-2.5 py-1.5 rounded-lg font-medium" style={{ background: 'var(--secondary-bg)', color: 'var(--primary)' }}>{c}</span>
-            ))}
+          <div className="p-5 sm:p-8">
+            {error && (
+              <div role="alert" className="mb-5 flex items-start justify-between gap-3 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700 dark:border-rose-900/70 dark:bg-rose-950/30 dark:text-rose-200">
+                <span>{error}</span>
+                <button type="button" onClick={() => setError('')} aria-label="Dismiss error" className="rounded-lg p-0.5 transition hover:bg-rose-100 dark:hover:bg-rose-900/50"><X size={16} /></button>
+              </div>
+            )}
+
+            <input ref={inputRef} type="file" accept="application/pdf,.pdf" className="sr-only" onChange={handleFileChange} />
+            <div
+              role="button"
+              tabIndex={0}
+              onKeyDown={handleUploadZoneKeyDown}
+              onClick={() => inputRef.current?.click()}
+              onDragEnter={(event) => { event.preventDefault(); setIsDragging(true) }}
+              onDragOver={(event) => { event.preventDefault(); setIsDragging(true) }}
+              onDragLeave={(event) => { event.preventDefault(); setIsDragging(false) }}
+              onDrop={handleDrop}
+              className={`group cursor-pointer rounded-3xl border-2 border-dashed px-5 py-10 text-center transition duration-200 sm:px-10 ${isDragging ? 'border-indigo-500 bg-indigo-50/75 scale-[1.01] dark:bg-indigo-950/30' : 'border-[var(--border)] bg-[var(--bg-surface)] hover:border-indigo-400 hover:bg-indigo-50/40 dark:hover:bg-indigo-950/20'}`}
+            >
+              <div className="mx-auto grid h-16 w-16 place-items-center rounded-3xl bg-indigo-100 text-indigo-600 transition group-hover:-translate-y-1 group-hover:scale-105 dark:bg-indigo-950/65 dark:text-indigo-300">
+                <Upload size={28} />
+              </div>
+              <h2 className="mt-5 text-lg font-bold text-[var(--text-primary)]">Drop your PDF here</h2>
+              <p className="mt-2 text-sm text-[var(--text-secondary)]">or <span className="font-semibold text-indigo-600 dark:text-indigo-300">browse from your device</span></p>
+              <p className="mt-3 text-xs text-[var(--text-muted)]">PDF only · Up to 15 MB · Text-based documents work best</p>
+            </div>
+
+            {file && (
+              <div className="mt-5 flex flex-col gap-4 rounded-2xl border border-[var(--border)] bg-[var(--bg-surface)] p-4 sm:flex-row sm:items-center sm:justify-between">
+                <div className="flex min-w-0 items-center gap-3">
+                  <div className="grid h-11 w-11 shrink-0 place-items-center rounded-xl bg-rose-100 text-rose-600 dark:bg-rose-950/50 dark:text-rose-300"><FileText size={21} /></div>
+                  <div className="min-w-0">
+                    <p className="truncate text-sm font-semibold text-[var(--text-primary)]">{file.name}</p>
+                    <p className="mt-0.5 text-xs text-[var(--text-muted)]">{formatFileSize(file.size)} · Ready to import</p>
+                  </div>
+                </div>
+                <button type="button" onClick={resetImport} className="inline-flex items-center gap-1.5 self-start rounded-lg px-2.5 py-1.5 text-xs font-semibold text-[var(--text-secondary)] transition hover:bg-rose-50 hover:text-rose-600 dark:hover:bg-rose-950/30 sm:self-auto"><X size={15} /> Remove</button>
+              </div>
+            )}
+
+            <div className="mt-7">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <h2 className="text-base font-bold text-[var(--text-primary)]">Choose what to create</h2>
+                  <p className="mt-1 text-sm text-[var(--text-secondary)]">You stay in control of how this material is organised.</p>
+                </div>
+                <ShieldCheck size={21} className="shrink-0 text-emerald-500" aria-label="Secure import" />
+              </div>
+              <div className="mt-4 grid gap-3 md:grid-cols-3">
+                {[
+                  { key: 'workspaceNote', title: 'Workspace note', description: 'Save the extracted text as an editable note.', icon: FileText, accent: 'indigo' },
+                  { key: 'summary', title: 'AI summary', description: 'Create a concise overview to review first.', icon: Sparkles, accent: 'violet' },
+                  { key: 'flashcards', title: 'Revision cards', description: 'Generate key cards from the document.', icon: Check, accent: 'emerald' },
+                ].map((option) => {
+                  const selected = options[option.key as keyof typeof options]
+                  const Icon = option.icon
+                  return (
+                    <button
+                      key={option.key}
+                      type="button"
+                      aria-pressed={selected}
+                      onClick={() => setOptions((current) => ({ ...current, [option.key]: !selected }))}
+                      className={`relative rounded-2xl border p-4 text-left transition ${selected ? 'border-indigo-300 bg-indigo-50/70 shadow-sm dark:border-indigo-700 dark:bg-indigo-950/25' : 'border-[var(--border)] bg-[var(--bg-surface)] hover:border-indigo-200 hover:bg-indigo-50/30 dark:hover:bg-indigo-950/15'}`}
+                    >
+                      <span className={`grid h-9 w-9 place-items-center rounded-xl ${option.accent === 'emerald' ? 'bg-emerald-100 text-emerald-600 dark:bg-emerald-950/50 dark:text-emerald-300' : option.accent === 'violet' ? 'bg-violet-100 text-violet-600 dark:bg-violet-950/50 dark:text-violet-300' : 'bg-indigo-100 text-indigo-600 dark:bg-indigo-950/60 dark:text-indigo-300'}`}><Icon size={18} /></span>
+                      <span className="mt-3 block text-sm font-semibold text-[var(--text-primary)]">{option.title}</span>
+                      <span className="mt-1 block text-xs leading-5 text-[var(--text-secondary)]">{option.description}</span>
+                      <span className={`absolute right-3 top-3 grid h-5 w-5 place-items-center rounded-full border ${selected ? 'border-indigo-500 bg-indigo-500 text-white' : 'border-[var(--border)] bg-[var(--bg-card)] text-transparent'}`}><Check size={13} strokeWidth={3} /></span>
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+
+            {phase === 'processing' && (
+              <div className="mt-7 rounded-2xl border border-indigo-100 bg-indigo-50/60 p-4 dark:border-indigo-900/60 dark:bg-indigo-950/25">
+                <div className="flex items-center justify-between gap-3 text-sm">
+                  <span className="inline-flex items-center gap-2 font-semibold text-indigo-800 dark:text-indigo-200"><LoaderCircle size={17} className="animate-spin" /> {processingLabel}</span>
+                  <span className="font-bold text-indigo-700 dark:text-indigo-300">{progress}%</span>
+                </div>
+                <div className="mt-3 h-2 overflow-hidden rounded-full bg-indigo-100 dark:bg-indigo-950/70"><div className="h-full rounded-full bg-gradient-to-r from-indigo-500 to-violet-500 transition-all duration-500" style={{ width: `${progress}%` }} /></div>
+              </div>
+            )}
+
+            <div className="mt-7 flex flex-col-reverse gap-3 border-t border-[var(--border)] pt-5 sm:flex-row sm:items-center sm:justify-between">
+              <p className="text-xs leading-5 text-[var(--text-muted)]">Your file is validated before processing. Scanned PDFs without selectable text may need OCR first.</p>
+              <button type="button" disabled={!file || phase === 'processing'} onClick={importPdf} className="inline-flex min-w-[170px] items-center justify-center gap-2 rounded-xl bg-indigo-600 px-5 py-3 text-sm font-semibold text-white shadow-md shadow-indigo-500/20 transition hover:-translate-y-0.5 hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:translate-y-0">
+                {phase === 'processing' ? <><LoaderCircle size={17} className="animate-spin" /> Processing…</> : <><Upload size={17} /> Import PDF</>}
+              </button>
+            </div>
           </div>
-        </div>
+        </section>
       </div>
-    </div>
+    </main>
   )
 }

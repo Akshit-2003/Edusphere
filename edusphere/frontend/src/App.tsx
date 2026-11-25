@@ -345,20 +345,20 @@ export default function App() {
           <div key={page} className={`route-transition route-transition--page authenticated-page authenticated-page--${page} min-h-full`}>
             <Suspense fallback={<RouteLoading />}>
               {page === 'dashboard' && <DashboardPage setPage={setPage} />}
-              {page === 'workspace' && <WorkspacePage onOpenDocument={(id) => { setActiveDocumentId(id); setPage('document') }} />}
+              {page === 'workspace' && <WorkspacePage onOpenDocument={(id) => { setActiveDocumentId(id); setPage('document') }} setPage={setPage} />}
               {page === 'document' && <DocumentEditorPage setPage={setPage} documentId={activeDocumentId} onDocumentChange={setActiveDocumentId} />}
               {page === 'planner' && <PlannerPage />}
               {page === 'calendar' && <CalendarPage />}
               {page === 'pomodoro' && <PomodoroPage />}
               {page === 'flashcards' && <FlashcardsPage />}
               {page === 'quiz' && <QuizPage setPage={setPage} />}
-              {page === 'ai-assistant' && <AIAssistantPage />}
+              {page === 'ai-assistant' && <AIAssistantPage setPage={setPage} />}
               {page === 'knowledge-graph' && <KnowledgeGraphPage setPage={setPage} />}
               {page === 'analytics' && <AnalyticsPage />}
               {page === 'classroom' && <ClassroomPage />}
-              {page === 'profile' && <ProfilePage dark={dark} setDark={setThemeWithAnimation} />}
+              {page === 'profile' && <ProfilePage dark={dark} setDark={setThemeWithAnimation} onUserUpdated={setCurrentUser} />}
               {page === 'search' && <SearchPage setPage={setPage} onOpenDocument={(id) => { setActiveDocumentId(id); setPage('document') }} />}
-              {page === 'pdf-upload' && <PDFUploadPage setPage={setPage} />}
+              {page === 'pdf-upload' && <PDFUploadPage setPage={setPage} onOpenDocument={(id) => { setActiveDocumentId(id); setPage('document') }} />}
             </Suspense>
           </div>
           {showOnboarding && (

@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, JSON, String, Text
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
 from app.core.database import Base
 from app.models.user import get_ist_time
 
@@ -42,6 +42,21 @@ class DocumentShare(Base):
     created_at = Column(DateTime, default=get_ist_time)
 
 
+class DocumentPresence(Base):
+    """A short-lived browser-session heartbeat for document collaboration."""
+    __tablename__ = "document_presence"
+    __table_args__ = (
+        UniqueConstraint("document_id", "user_id", "session_id", name="uq_document_presence_session"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    document_id = Column(Integer, ForeignKey("documents.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    session_id = Column(String(80), nullable=False)
+    is_editing = Column(Boolean, default=False, nullable=False)
+    last_active_at = Column(DateTime, default=get_ist_time, nullable=False, index=True)
+
+
 class StudyTask(Base):
     __tablename__ = "study_tasks"
     id = Column(Integer, primary_key=True)
@@ -66,6 +81,7 @@ class CalendarEvent(Base):
     ends_at = Column(DateTime, nullable=True)
     event_type = Column(String, default="study", nullable=False)
     color = Column(String, default="#4f46e5", nullable=False)
+    priority = Column(String, default="medium", nullable=False)
     created_at = Column(DateTime, default=get_ist_time)
 
 
@@ -73,6 +89,7 @@ class StudySession(Base):
     __tablename__ = "study_sessions"
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    task_id = Column(Integer, ForeignKey("study_tasks.id"), nullable=True, index=True)
     duration_minutes = Column(Integer, nullable=False)
     focus_type = Column(String, default="focus", nullable=False)
     completed_at = Column(DateTime, default=get_ist_time)
@@ -149,6 +166,17 @@ class AssistantMessage(Base):
     __tablename__ = "assistant_messages"
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    conversation_id = Column(Integer, ForeignKey("assistant_conversations.id"), nullable=True, index=True)
     role = Column(String, nullable=False)
     content = Column(Text, nullable=False)
+    context_items = Column(JSON, default=list, nullable=False)
     created_at = Column(DateTime, default=get_ist_time, index=True)
+
+
+class AssistantConversation(Base):
+    __tablename__ = "assistant_conversations"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    title = Column(String(160), nullable=False, default="New study chat")
+    created_at = Column(DateTime, default=get_ist_time, nullable=False)
+    updated_at = Column(DateTime, default=get_ist_time, onupdate=get_ist_time, nullable=False, index=True)

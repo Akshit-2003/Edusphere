@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import { AlertCircle, Plus, Star, FolderOpen, FileText, Search, MoreHorizontal, RefreshCw } from 'lucide-react'
-import type { StudyDocument } from '../types'
-import { api, currentUserId } from '../lib/api'
+import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react'
+import { AlertCircle, Plus, Star, FolderOpen, FileText, Search, MoreHorizontal, RefreshCw, CheckCircle2, ListTodo, Upload, CreditCard, Sparkles, CalendarDays, X } from 'lucide-react'
+import type { CalendarEvent, Page, StudyDocument, StudyTask } from '../types'
+import { api, ApiError, currentUserId } from '../lib/api'
 
 const folderColors = ['#4f46e5', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6']
 const cacheLifetime = 5 * 60 * 1000
@@ -31,7 +31,7 @@ function formatRelativeTime(value: string) {
   return hours < 24 ? `Edited ${hours}h ago` : `Edited ${Math.floor(hours / 24)}d ago`
 }
 
-export default function WorkspacePage({ onOpenDocument }: { onOpenDocument: (id: number) => void }) {
+export default function WorkspacePage({ onOpenDocument, setPage }: { onOpenDocument: (id: number) => void; setPage: (page: Page) => void }) {
   const [search, setSearch] = useState('')
   const [docs, setDocs] = useState<StudyDocument[]>([])
   const [activeFolder, setActiveFolder] = useState<string | null>(null)
@@ -40,6 +40,14 @@ export default function WorkspacePage({ onOpenDocument }: { onOpenDocument: (id:
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
+  const [tasks, setTasks] = useState<StudyTask[]>([])
+  const [events, setEvents] = useState<CalendarEvent[]>([])
+  const [overviewLoading, setOverviewLoading] = useState(true)
+  const [showQuickTask, setShowQuickTask] = useState(false)
+  const [quickTaskTitle, setQuickTaskTitle] = useState('')
+  const [quickTaskSubject, setQuickTaskSubject] = useState('')
+  const [quickTaskDueAt, setQuickTaskDueAt] = useState('')
+  const [savingQuickTask, setSavingQuickTask] = useState(false)
 
   const updateDocuments = useCallback((documents: StudyDocument[]) => {
     setDocs(documents)
@@ -82,6 +90,31 @@ export default function WorkspacePage({ onOpenDocument }: { onOpenDocument: (id:
   useEffect(() => {
     void loadDocuments()
   }, [loadDocuments])
+
+  const loadStudyOverview = useCallback(async () => {
+    const userId = currentUserId()
+    if (!userId) {
+      setOverviewLoading(false)
+      return
+    }
+    setOverviewLoading(true)
+    try {
+      const [storedTasks, storedEvents] = await Promise.all([
+        api<StudyTask[]>(`/study-tasks/?user_id=${userId}`),
+        api<CalendarEvent[]>(`/events/?user_id=${userId}`),
+      ])
+      setTasks(storedTasks)
+      setEvents(storedEvents)
+    } catch (requestError) {
+      setError(requestError instanceof ApiError ? requestError.message : 'Your study overview could not be loaded. Please try again.')
+    } finally {
+      setOverviewLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    void loadStudyOverview()
+  }, [loadStudyOverview])
 
   const filtered = useMemo(() => docs.filter(d => {
     const matchSearch = d.title.toLowerCase().includes(search.toLowerCase())
@@ -174,6 +207,70 @@ export default function WorkspacePage({ onOpenDocument }: { onOpenDocument: (id:
     }
   }
 
+  const activeTask = useMemo(() => {
+    const pending = tasks.filter(task => task.status !== 'done')
+    return [...pending].sort((left, right) => {
+      const leftRank = left.status === 'inprogress' ? 0 : left.status === 'review' ? 1 : 2
+      const rightRank = right.status === 'inprogress' ? 0 : right.status === 'review' ? 1 : 2
+      if (leftRank !== rightRank) return leftRank - rightRank
+      const leftDue = left.due_at ? new Date(left.due_at).getTime() : Number.MAX_SAFE_INTEGER
+      const rightDue = right.due_at ? new Date(right.due_at).getTime() : Number.MAX_SAFE_INTEGER
+      return leftDue - rightDue
+    })[0] ?? null
+  }, [tasks])
+
+  const quickNotes = useMemo(() => [...docs]
+    .sort((left, right) => Number(right.is_starred) - Number(left.is_starred) || new Date(right.updated_at).getTime() - new Date(left.updated_at).getTime())
+    .slice(0, 4), [docs])
+
+  const upcoming = useMemo(() => {
+    const now = Date.now()
+    return events.filter(event => new Date(event.starts_at).getTime() >= now)
+      .sort((left, right) => new Date(left.starts_at).getTime() - new Date(right.starts_at).getTime())
+      .slice(0, 3)
+  }, [events])
+
+  const completeActiveTask = async () => {
+    if (!activeTask) return
+    setError('')
+    try {
+      const updated = await api<StudyTask>(`/study-tasks/${activeTask.id}`, { method: 'PUT', body: JSON.stringify({ status: 'done' }) })
+      setTasks(previous => previous.map(task => task.id === updated.id ? updated : task))
+      setNotice(`“${updated.title}” marked complete.`)
+    } catch (requestError) {
+      setError(requestError instanceof ApiError ? requestError.message : 'The task could not be updated. Please try again.')
+    }
+  }
+
+  const createQuickTask = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    const userId = currentUserId()
+    const title = quickTaskTitle.trim()
+    if (!userId || !title) return
+    if (quickTaskDueAt && Number.isNaN(new Date(quickTaskDueAt).getTime())) {
+      setError('Choose a valid due date and time.')
+      return
+    }
+    setSavingQuickTask(true)
+    setError('')
+    try {
+      const created = await api<StudyTask>('/study-tasks/', {
+        method: 'POST',
+        body: JSON.stringify({ user_id: userId, title, subject: quickTaskSubject.trim() || null, priority: 'medium', status: 'todo', due_at: quickTaskDueAt || null }),
+      })
+      setTasks(previous => [created, ...previous])
+      setQuickTaskTitle('')
+      setQuickTaskSubject('')
+      setQuickTaskDueAt('')
+      setShowQuickTask(false)
+      setNotice(`“${created.title}” was added to your planner.`)
+    } catch (requestError) {
+      setError(requestError instanceof ApiError ? requestError.message : 'The task could not be saved. Please try again.')
+    } finally {
+      setSavingQuickTask(false)
+    }
+  }
+
   return (
     <div className="flex h-full overflow-hidden">
       {/* Workspace sidebar */}
@@ -238,6 +335,28 @@ export default function WorkspacePage({ onOpenDocument }: { onOpenDocument: (id:
           {[['TOTAL NOTES', docs.length], ['FOLDERS', folders.length], ['FAVORITES', docs.filter(document => document.is_starred).length]].map(([label, value]) => (
             <div key={String(label)} className="rounded-xl border p-3 sm:p-4" style={{ background: 'var(--card)', borderColor: 'var(--border)' }}><p className="text-[10px] font-semibold tracking-wide sm:text-xs" style={{ color: 'var(--muted-foreground)' }}>{label}</p><p className="mt-1 text-xl font-bold sm:text-2xl" style={{ color: 'var(--foreground)' }}>{value}</p></div>
           ))}
+        </div>
+        <div className="mb-7 grid grid-cols-1 gap-5 xl:grid-cols-[minmax(0,1fr)_19rem]">
+          <section className="space-y-5">
+            <div className="overflow-hidden rounded-2xl border" style={{ background: 'linear-gradient(135deg, color-mix(in srgb, var(--primary) 10%, var(--card)), var(--card))', borderColor: 'var(--border)' }}>
+              <div className="flex items-start justify-between gap-4 p-5 sm:p-6">
+                <div className="min-w-0"><div className="mb-2 flex items-center gap-2 text-sm font-semibold" style={{ color: 'var(--primary)' }}><ListTodo size={16} /> Active focus</div>{overviewLoading ? <div className="h-7 w-2/3 animate-pulse rounded" style={{ background: 'var(--muted)' }} /> : activeTask ? <><h2 className="truncate text-xl font-heading font-bold" style={{ color: 'var(--foreground)' }}>{activeTask.title}</h2><p className="mt-1 text-sm" style={{ color: 'var(--muted-foreground)' }}>{activeTask.subject || 'General study'} · {activeTask.estimate_minutes ? `${activeTask.estimate_minutes} min estimate` : activeTask.due_at ? `Due ${new Date(activeTask.due_at).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })}` : 'No deadline set'}</p></> : <><h2 className="text-xl font-heading font-bold" style={{ color: 'var(--foreground)' }}>Your desk is clear</h2><p className="mt-1 text-sm" style={{ color: 'var(--muted-foreground)' }}>Add a focused task and it will appear here.</p></>}</div>
+                {activeTask ? <button onClick={() => void completeActiveTask()} className="inline-flex shrink-0 items-center gap-1.5 rounded-lg px-3 py-2 text-sm font-semibold transition-transform hover:-translate-y-0.5" style={{ background: 'var(--primary)', color: '#fff' }}><CheckCircle2 size={16} /> Complete</button> : <button onClick={() => setShowQuickTask(true)} className="inline-flex shrink-0 items-center gap-1.5 rounded-lg px-3 py-2 text-sm font-semibold" style={{ background: 'var(--primary)', color: '#fff' }}><Plus size={16} /> Add task</button>}
+              </div>
+              {activeTask && <div className="flex items-center justify-between border-t px-5 py-3 text-xs sm:px-6" style={{ borderColor: 'var(--border)', color: 'var(--muted-foreground)' }}><span>{tasks.filter(task => task.status !== 'done').length} open planner task{tasks.filter(task => task.status !== 'done').length === 1 ? '' : 's'}</span><button onClick={() => setPage('planner')} className="font-semibold hover:underline" style={{ color: 'var(--primary)' }}>Open planner →</button></div>}
+            </div>
+
+            <div className="rounded-2xl border p-5" style={{ background: 'var(--card)', borderColor: 'var(--border)' }}>
+              <div className="mb-4 flex items-center justify-between"><div><p className="text-sm font-semibold" style={{ color: 'var(--foreground)' }}>Quick access</p><p className="mt-0.5 text-xs" style={{ color: 'var(--muted-foreground)' }}>Pinned and recently edited notes</p></div><button onClick={() => setActiveFolder(null)} className="text-xs font-semibold hover:underline" style={{ color: 'var(--primary)' }}>View all</button></div>
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">{quickNotes.map(document => <button key={document.id} onClick={() => onOpenDocument(document.id)} className="flex min-w-0 items-center gap-3 rounded-xl border p-3 text-left transition-colors hover:border-primary/50" style={{ background: 'var(--muted)', borderColor: 'var(--border)' }}><div className="rounded-lg p-2" style={{ background: document.is_starred ? '#f59e0b18' : 'var(--card)', color: document.is_starred ? '#d97706' : 'var(--primary)' }}>{document.is_starred ? <Star size={15} fill="currentColor" /> : <FileText size={15} />}</div><div className="min-w-0"><p className="truncate text-sm font-medium" style={{ color: 'var(--foreground)' }}>{document.title}</p><p className="truncate text-xs" style={{ color: 'var(--muted-foreground)' }}>{document.folder} · {formatRelativeTime(document.updated_at)}</p></div></button>)}{!loading && !quickNotes.length && <button onClick={() => void createDocument()} className="rounded-xl border border-dashed p-4 text-left text-sm hover:border-primary/50" style={{ borderColor: 'var(--border)', color: 'var(--muted-foreground)' }}>Create your first quick note</button>}</div>
+            </div>
+          </section>
+
+          <aside className="space-y-5">
+            <div className="rounded-2xl border p-4" style={{ background: 'var(--card)', borderColor: 'var(--border)' }}><p className="mb-3 text-sm font-semibold" style={{ color: 'var(--foreground)' }}>Mini tools</p><div className="grid grid-cols-2 gap-2"><button onClick={() => setShowQuickTask(true)} className="rounded-xl border p-3 text-left transition-colors hover:border-primary/50" style={{ borderColor: 'var(--border)', background: 'var(--muted)' }}><Plus size={16} style={{ color: 'var(--primary)' }} /><p className="mt-2 text-xs font-semibold" style={{ color: 'var(--foreground)' }}>New task</p></button><button onClick={() => void createDocument()} className="rounded-xl border p-3 text-left transition-colors hover:border-primary/50" style={{ borderColor: 'var(--border)', background: 'var(--muted)' }}><FileText size={16} style={{ color: '#10b981' }} /><p className="mt-2 text-xs font-semibold" style={{ color: 'var(--foreground)' }}>Quick note</p></button><button onClick={() => setPage('pdf-upload')} className="rounded-xl border p-3 text-left transition-colors hover:border-primary/50" style={{ borderColor: 'var(--border)', background: 'var(--muted)' }}><Upload size={16} style={{ color: '#f59e0b' }} /><p className="mt-2 text-xs font-semibold" style={{ color: 'var(--foreground)' }}>Import PDF</p></button><button onClick={() => setPage('flashcards')} className="rounded-xl border p-3 text-left transition-colors hover:border-primary/50" style={{ borderColor: 'var(--border)', background: 'var(--muted)' }}><CreditCard size={16} style={{ color: '#8b5cf6' }} /><p className="mt-2 text-xs font-semibold" style={{ color: 'var(--foreground)' }}>Revise cards</p></button></div></div>
+            <div className="rounded-2xl border p-4" style={{ background: 'var(--card)', borderColor: 'var(--border)' }}><div className="mb-3 flex items-center justify-between"><p className="text-sm font-semibold" style={{ color: 'var(--foreground)' }}>Upcoming reminders</p><CalendarDays size={16} style={{ color: 'var(--primary)' }} /></div><div className="space-y-2">{overviewLoading && <div className="h-12 animate-pulse rounded-lg" style={{ background: 'var(--muted)' }} />}{!overviewLoading && upcoming.map(event => <button key={event.id} onClick={() => setPage('calendar')} className="w-full rounded-xl border p-3 text-left hover:border-primary/50" style={{ borderColor: 'var(--border)', background: 'var(--muted)' }}><p className="truncate text-sm font-medium" style={{ color: 'var(--foreground)' }}>{event.title}</p><p className="mt-0.5 text-xs" style={{ color: 'var(--muted-foreground)' }}>{new Date(event.starts_at).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })} · {event.event_type}</p></button>)}{!overviewLoading && !upcoming.length && <p className="rounded-xl border border-dashed p-3 text-xs" style={{ borderColor: 'var(--border)', color: 'var(--muted-foreground)' }}>No upcoming events. Add one in Calendar.</p>}</div></div>
+            <button onClick={() => setPage('ai-assistant')} className="w-full rounded-2xl border p-4 text-left transition-transform hover:-translate-y-0.5" style={{ background: 'linear-gradient(135deg, #4f46e515, #8b5cf615)', borderColor: 'var(--primary)30' }}><div className="flex items-center gap-2"><Sparkles size={17} style={{ color: 'var(--accent)' }} /><span className="text-sm font-semibold" style={{ color: 'var(--foreground)' }}>Ask EduSphere AI</span></div><p className="mt-1 text-xs" style={{ color: 'var(--muted-foreground)' }}>Turn your notes and tasks into a study plan.</p></button>
+          </aside>
         </div>
         {/* Actions bar */}
         <div className="flex flex-wrap items-center gap-3 mb-6">
@@ -329,6 +448,7 @@ export default function WorkspacePage({ onOpenDocument }: { onOpenDocument: (id:
         </div>
         </div>
       </div>
+      {showQuickTask && <div className="fixed inset-0 z-[100] flex items-end justify-center bg-black/45 p-0 backdrop-blur-sm sm:items-center sm:p-4" onMouseDown={() => !savingQuickTask && setShowQuickTask(false)}><form onSubmit={event => void createQuickTask(event)} onMouseDown={event => event.stopPropagation()} className="w-full max-w-lg rounded-t-2xl border p-5 shadow-2xl sm:rounded-2xl sm:p-6" style={{ background: 'var(--card)', borderColor: 'var(--border)' }}><div className="mb-5 flex items-start justify-between gap-4"><div><p className="text-sm font-medium" style={{ color: 'var(--primary)' }}>Workspace shortcut</p><h2 className="text-xl font-heading font-bold" style={{ color: 'var(--foreground)' }}>Add a focused task</h2><p className="mt-1 text-sm" style={{ color: 'var(--muted-foreground)' }}>This is saved directly to your study planner.</p></div><button type="button" onClick={() => setShowQuickTask(false)} disabled={savingQuickTask} aria-label="Close task form" className="rounded-lg p-2 hover:bg-muted disabled:opacity-50" style={{ color: 'var(--muted-foreground)' }}><X size={18} /></button></div><div className="space-y-4"><label className="block"><span className="mb-1.5 block text-sm font-medium" style={{ color: 'var(--foreground)' }}>Task title <span style={{ color: '#dc2626' }}>*</span></span><input required autoFocus value={quickTaskTitle} onChange={event => setQuickTaskTitle(event.target.value)} placeholder="e.g. Finish DBMS revision" className="w-full rounded-lg border px-3 py-2.5 text-sm outline-none focus:border-primary" style={{ background: 'var(--muted)', borderColor: 'var(--border)', color: 'var(--foreground)' }} /></label><div className="grid grid-cols-1 gap-4 sm:grid-cols-2"><label className="block"><span className="mb-1.5 block text-sm font-medium" style={{ color: 'var(--foreground)' }}>Subject</span><input value={quickTaskSubject} onChange={event => setQuickTaskSubject(event.target.value)} placeholder="Optional" className="w-full rounded-lg border px-3 py-2.5 text-sm outline-none focus:border-primary" style={{ background: 'var(--muted)', borderColor: 'var(--border)', color: 'var(--foreground)' }} /></label><label className="block"><span className="mb-1.5 block text-sm font-medium" style={{ color: 'var(--foreground)' }}>Due date</span><input type="datetime-local" value={quickTaskDueAt} onChange={event => setQuickTaskDueAt(event.target.value)} className="w-full rounded-lg border px-3 py-2.5 text-sm outline-none focus:border-primary" style={{ background: 'var(--muted)', borderColor: 'var(--border)', color: 'var(--foreground)' }} /></label></div></div><div className="mt-6 flex justify-end gap-2"><button type="button" onClick={() => setShowQuickTask(false)} disabled={savingQuickTask} className="rounded-lg border px-4 py-2 text-sm font-medium hover:bg-muted disabled:opacity-50" style={{ borderColor: 'var(--border)', color: 'var(--foreground)' }}>Cancel</button><button disabled={savingQuickTask} className="inline-flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-semibold disabled:opacity-60" style={{ background: 'var(--primary)', color: '#fff' }}><Plus size={15} />{savingQuickTask ? 'Saving…' : 'Add task'}</button></div></form></div>}
     </div>
   )
 }

@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from 'react'
-import { Plus, Flag, Clock, MoreHorizontal, X } from 'lucide-react'
+import { Plus, Flag, Clock, MoreHorizontal, X, Edit2 } from 'lucide-react'
 import { api, ApiError, currentUserId } from '../lib/api'
 import type { StudyTask } from '../types'
 
@@ -29,6 +29,12 @@ const newTaskForm = (status: TaskStatus): TaskForm => ({
   title: '', description: '', subject: '', priority: 'medium', status, estimateMinutes: '', dueAt: '',
 })
 
+function toDateTimeLocal(value: string): string {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return ''
+  return new Date(date.getTime() - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 16)
+}
+
 export default function PlannerPage() {
   const [cols2, setCols2] = useState(emptyColumns)
   const [dragging, setDragging] = useState<number | null>(null)
@@ -37,6 +43,7 @@ export default function PlannerPage() {
   const [priorityFilter, setPriorityFilter] = useState('all')
   const [openTaskMenu, setOpenTaskMenu] = useState<number | null>(null)
   const [showTaskForm, setShowTaskForm] = useState(false)
+  const [editingTask, setEditingTask] = useState<StudyTask | null>(null)
   const [taskForm, setTaskForm] = useState<TaskForm>(newTaskForm('todo'))
   const [savingTask, setSavingTask] = useState(false)
   const [formError, setFormError] = useState('')
@@ -86,13 +93,27 @@ export default function PlannerPage() {
     }
   }
 
-  const openTaskForm = (status: TaskStatus = 'todo') => {
-    setTaskForm(newTaskForm(status))
+  const openTaskForm = (status: TaskStatus = 'todo', taskToEdit?: StudyTask) => {
+    if (taskToEdit) {
+      setEditingTask(taskToEdit)
+      setTaskForm({
+        title: taskToEdit.title,
+        description: taskToEdit.description || '',
+        subject: taskToEdit.subject || '',
+        priority: taskToEdit.priority,
+        status: taskToEdit.status,
+        estimateMinutes: taskToEdit.estimate_minutes ? String(taskToEdit.estimate_minutes) : '',
+        dueAt: taskToEdit.due_at ? toDateTimeLocal(taskToEdit.due_at) : '',
+      })
+    } else {
+      setEditingTask(null)
+      setTaskForm(newTaskForm(status))
+    }
     setFormError('')
     setShowTaskForm(true)
   }
 
-  const createTask = async (event: FormEvent<HTMLFormElement>) => {
+  const handleSaveTask = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const title = taskForm.title.trim()
     const userId = currentUserId()
@@ -109,8 +130,8 @@ export default function PlannerPage() {
       setFormError('Estimated time must be a whole number of at least 1 minute.')
       return
     }
-    const dueAt = taskForm.dueAt ? new Date(taskForm.dueAt) : null
-    if (dueAt && Number.isNaN(dueAt.getTime())) {
+    const dueAt = taskForm.dueAt.trim() || null
+    if (dueAt && Number.isNaN(new Date(dueAt).getTime())) {
       setFormError('Choose a valid due date and time, or clear the field.')
       return
     }
@@ -118,21 +139,45 @@ export default function PlannerPage() {
     setSavingTask(true)
     setFormError('')
     try {
-      const task = await api<StudyTask>('/study-tasks/', {
-        method: 'POST',
-        body: JSON.stringify({
-          user_id: userId,
-          title,
-          description: taskForm.description.trim() || null,
-          subject: taskForm.subject.trim() || null,
-          priority: taskForm.priority,
-          status: taskForm.status,
-          estimate_minutes: estimateMinutes,
-          due_at: dueAt?.toISOString() ?? null,
-        }),
-      })
-      setCols2(previous => ({ ...previous, [task.status]: [task, ...(previous[task.status] ?? [])] }))
-      setNotice(`“${task.title}” was added to ${cols.find(column => column.id === task.status)?.label ?? 'the planner'}.`)
+      if (editingTask) {
+        const updated = await api<StudyTask>(`/study-tasks/${editingTask.id}`, {
+          method: 'PUT',
+          body: JSON.stringify({
+            title,
+            description: taskForm.description.trim() || null,
+            subject: taskForm.subject.trim() || null,
+            priority: taskForm.priority,
+            status: taskForm.status,
+            estimate_minutes: estimateMinutes,
+            due_at: dueAt,
+          }),
+        })
+        setCols2(previous => {
+          const next = { ...previous }
+          for (const col of Object.keys(next)) {
+            next[col] = next[col].filter(t => t.id !== updated.id)
+          }
+          next[updated.status] = [updated, ...(next[updated.status] ?? [])]
+          return next
+        })
+        setNotice(`“${updated.title}” was successfully updated.`)
+      } else {
+        const task = await api<StudyTask>('/study-tasks/', {
+          method: 'POST',
+          body: JSON.stringify({
+            user_id: userId,
+            title,
+            description: taskForm.description.trim() || null,
+            subject: taskForm.subject.trim() || null,
+            priority: taskForm.priority,
+            status: taskForm.status,
+            estimate_minutes: estimateMinutes,
+            due_at: dueAt,
+          }),
+        })
+        setCols2(previous => ({ ...previous, [task.status]: [task, ...(previous[task.status] ?? [])] }))
+        setNotice(`“${task.title}” was added to the planner.`)
+      }
       setShowTaskForm(false)
     } catch (error) {
       setFormError(error instanceof ApiError ? error.message : 'The task could not be saved. Please try again.')
@@ -239,10 +284,14 @@ export default function PlannerPage() {
                     </button>
                   </div>
                   {openTaskMenu === task.id && (
-                    <div className="absolute right-3 top-9 z-20 w-32 rounded-lg border py-1 shadow-lg" style={{ background: 'var(--card)', borderColor: 'var(--border)' }}>
+                    <div className="absolute right-3 top-9 z-20 w-36 rounded-lg border py-1 shadow-lg" style={{ background: 'var(--card)', borderColor: 'var(--border)' }}>
+                      <button onClick={() => { openTaskForm(task.status, task); setOpenTaskMenu(null) }} className="flex items-center gap-2 w-full px-3 py-1.5 text-left text-xs hover:bg-muted" style={{ color: 'var(--foreground)' }}><Edit2 size={12} /> Edit task</button>
                       {col.id !== 'done' && <button onClick={() => { void moveTask(task.id, 'done'); setOpenTaskMenu(null) }} className="w-full px-3 py-1.5 text-left text-xs hover:bg-muted" style={{ color: 'var(--foreground)' }}>Mark done</button>}
                       <button onClick={() => void deleteTask(task.id)} className="w-full px-3 py-1.5 text-left text-xs hover:bg-muted" style={{ color: '#ef4444' }}>Delete task</button>
                     </div>
+                  )}
+                  {task.description && (
+                    <p className="text-xs mb-2.5 line-clamp-2" style={{ color: 'var(--muted-foreground)' }}>{task.description}</p>
                   )}
                   <div className="flex items-center gap-1.5 text-xs mb-2.5" style={{ color: 'var(--muted-foreground)' }}>
                     <span className="px-2 py-0.5 rounded-full" style={{ background: 'var(--muted)' }}>{task.subject ?? 'General'}</span>
@@ -273,7 +322,7 @@ export default function PlannerPage() {
       {showTaskForm && (
         <div className="fixed inset-0 z-[100] flex items-end justify-center bg-black/45 p-0 backdrop-blur-sm sm:items-center sm:p-4" onMouseDown={() => !savingTask && setShowTaskForm(false)}>
           <form
-            onSubmit={event => void createTask(event)}
+            onSubmit={event => void handleSaveTask(event)}
             onMouseDown={event => event.stopPropagation()}
             className="max-h-[calc(100dvh-0.75rem)] w-full overflow-y-auto overscroll-contain rounded-t-2xl border p-5 pb-6 shadow-2xl sm:max-h-[calc(100dvh-2rem)] sm:max-w-xl sm:rounded-2xl sm:p-6"
             style={{ background: 'var(--card)', borderColor: 'var(--border)' }}
@@ -282,7 +331,15 @@ export default function PlannerPage() {
             aria-labelledby="new-task-heading"
           >
             <div className="mb-5 flex items-start justify-between gap-4">
-              <div><p className="text-sm font-medium" style={{ color: 'var(--primary)' }}>Planner</p><h2 id="new-task-heading" className="mt-0.5 text-xl font-heading font-bold" style={{ color: 'var(--foreground)' }}>Add a study task</h2><p className="mt-1 text-sm" style={{ color: 'var(--muted-foreground)' }}>Add the details once—your task is saved directly to your planner.</p></div>
+              <div>
+                <p className="text-sm font-medium" style={{ color: 'var(--primary)' }}>Planner</p>
+                <h2 id="new-task-heading" className="mt-0.5 text-xl font-heading font-bold" style={{ color: 'var(--foreground)' }}>
+                  {editingTask ? 'Edit study task' : 'Add a study task'}
+                </h2>
+                <p className="mt-1 text-sm" style={{ color: 'var(--muted-foreground)' }}>
+                  {editingTask ? 'Update your task details below.' : 'Add the details once—your task is saved directly to your planner.'}
+                </p>
+              </div>
               <button type="button" onClick={() => setShowTaskForm(false)} disabled={savingTask} aria-label="Close task form" className="rounded-lg p-2 hover:bg-muted disabled:opacity-50" style={{ color: 'var(--muted-foreground)' }}><X size={18} /></button>
             </div>
 
@@ -299,7 +356,12 @@ export default function PlannerPage() {
             </div>
 
             {formError && <p className="mt-4 rounded-lg px-3 py-2 text-sm" style={{ background: 'color-mix(in srgb, #ef4444 10%, var(--card))', color: '#dc2626' }}>{formError}</p>}
-            <div className="mt-6 flex justify-end gap-2"><button type="button" onClick={() => setShowTaskForm(false)} disabled={savingTask} className="rounded-lg border px-4 py-2 text-sm font-medium hover:bg-muted disabled:opacity-50" style={{ borderColor: 'var(--border)', color: 'var(--foreground)' }}>Cancel</button><button type="submit" disabled={savingTask} className="inline-flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-semibold disabled:opacity-60" style={{ background: 'var(--primary)', color: '#fff' }}><Plus size={15} />{savingTask ? 'Saving…' : 'Add task'}</button></div>
+            <div className="mt-6 flex justify-end gap-2">
+              <button type="button" onClick={() => setShowTaskForm(false)} disabled={savingTask} className="rounded-lg border px-4 py-2 text-sm font-medium hover:bg-muted disabled:opacity-50" style={{ borderColor: 'var(--border)', color: 'var(--foreground)' }}>Cancel</button>
+              <button type="submit" disabled={savingTask} className="inline-flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-semibold disabled:opacity-60" style={{ background: 'var(--primary)', color: '#fff' }}>
+                <Plus size={15} />{savingTask ? 'Saving…' : (editingTask ? 'Update task' : 'Add task')}
+              </button>
+            </div>
           </form>
         </div>
       )}

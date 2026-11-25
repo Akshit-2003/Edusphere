@@ -1,5 +1,5 @@
 # app/models/academic.py
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, UniqueConstraint
 from sqlalchemy.orm import relationship
 from app.core.database import Base
 from app.models.user import get_ist_time
@@ -11,6 +11,7 @@ class Classroom(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, index=True) # e.g., "B.Tech CS 3rd Year"
     section = Column(String, nullable=True) # e.g., "Section A"
+    class_code = Column(String(6), unique=True, index=True, nullable=False)
     
     # Ek teacher (user) is classroom ko banayega/manage karega
     teacher_id = Column(Integer, ForeignKey("users.id"))
@@ -18,6 +19,21 @@ class Classroom(Base):
 
     # Relationship: Ek classroom mein bohot saare courses ho sakte hain
     courses = relationship("Course", back_populates="classroom")
+    members = relationship("ClassroomMember", back_populates="classroom", cascade="all, delete-orphan")
+
+
+class ClassroomMember(Base):
+    """Classroom-scoped memberships; this never changes a user's global role."""
+    __tablename__ = "classroom_members"
+    __table_args__ = (UniqueConstraint("classroom_id", "user_id", name="uq_classroom_member"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    classroom_id = Column(Integer, ForeignKey("classrooms.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    role = Column(String(20), nullable=False, default="student")
+    joined_at = Column(DateTime, default=get_ist_time, nullable=False)
+
+    classroom = relationship("Classroom", back_populates="members")
 
 
 # 2. COURSES TABLE

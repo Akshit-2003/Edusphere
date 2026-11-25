@@ -1,6 +1,23 @@
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+# India does not use daylight-saving time, so a fixed standard-library offset
+# is more reliable on Windows deployments that do not include the tzdata package.
+IST = timezone(timedelta(hours=5, minutes=30), name="IST")
+
+
+def database_datetime(value: datetime | None) -> datetime | None:
+    """Store user-selected datetimes as naive IST values for TIMESTAMP columns.
+
+    The existing database schema intentionally uses ``TIMESTAMP WITHOUT TIME
+    ZONE``. Browser ISO values include ``Z`` and are therefore timezone-aware;
+    asyncpg rejects those values unless they are normalised first.
+    """
+    if value is None or value.tzinfo is None:
+        return value
+    return value.astimezone(IST).replace(tzinfo=None)
 
 
 class ORMModel(BaseModel):
@@ -10,6 +27,7 @@ class ORMModel(BaseModel):
 
 class ProfileUpdate(BaseModel):
     full_name: Optional[str] = Field(default=None, min_length=2, max_length=120)
+    email: Optional[str] = Field(default=None, max_length=320)
     bio: Optional[str] = None
     daily_goal_hours: Optional[int] = Field(default=None, ge=1, le=24)
     department: Optional[str] = Field(default=None, max_length=160)
@@ -21,11 +39,22 @@ class ProfileUpdate(BaseModel):
     preferences: Optional[dict[str, bool]] = None
     avatar_url: Optional[str] = Field(default=None, max_length=1_500_000)
 
+    @field_validator('email')
+    @classmethod
+    def validate_email(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        normalized = value.strip().lower()
+        if '@' not in normalized or normalized.startswith('@') or normalized.endswith('@'):
+            raise ValueError('Please provide a valid email address.')
+        return normalized
+
 
 class ProfileResponse(ORMModel):
     user_id: int
     full_name: str
     email: str
+    email_verified: bool
     bio: Optional[str]
     daily_goal_hours: int
     department: Optional[str]
@@ -78,6 +107,20 @@ class DocumentShareResponse(ORMModel):
     created_at: datetime
 
 
+class DocumentPresenceUpdate(BaseModel):
+    user_id: int = Field(gt=0)
+    session_id: str = Field(min_length=8, max_length=80)
+    is_editing: bool = False
+
+
+class DocumentCollaboratorResponse(BaseModel):
+    user_id: int
+    full_name: str
+    avatar_url: Optional[str] = None
+    is_editing: bool
+    last_active_at: datetime
+
+
 class TaskCreate(BaseModel):
     user_id: int
     title: str = Field(min_length=1, max_length=250)
@@ -88,6 +131,11 @@ class TaskCreate(BaseModel):
     due_at: Optional[datetime] = None
     estimate_minutes: Optional[int] = Field(default=None, ge=1)
 
+    @field_validator("due_at")
+    @classmethod
+    def normalize_due_at(cls, value: datetime | None) -> datetime | None:
+        return database_datetime(value)
+
 
 class TaskUpdate(BaseModel):
     title: Optional[str] = Field(default=None, min_length=1, max_length=250)
@@ -97,6 +145,11 @@ class TaskUpdate(BaseModel):
     status: Optional[str] = Field(default=None, pattern="^(todo|inprogress|review|done)$")
     due_at: Optional[datetime] = None
     estimate_minutes: Optional[int] = Field(default=None, ge=1)
+
+    @field_validator("due_at")
+    @classmethod
+    def normalize_due_at(cls, value: datetime | None) -> datetime | None:
+        return database_datetime(value)
 
 
 class TaskResponse(ORMModel):
@@ -118,6 +171,26 @@ class EventCreate(BaseModel):
     ends_at: Optional[datetime] = None
     event_type: str = "study"
     color: str = "#4f46e5"
+    priority: str = Field(default="medium", pattern="^(low|medium|high)$")
+
+    @field_validator("starts_at", "ends_at")
+    @classmethod
+    def normalize_event_datetime(cls, value: datetime | None) -> datetime | None:
+        return database_datetime(value)
+
+
+class EventUpdate(BaseModel):
+    title: Optional[str] = Field(default=None, min_length=1, max_length=250)
+    starts_at: Optional[datetime] = None
+    ends_at: Optional[datetime] = None
+    event_type: Optional[str] = None
+    color: Optional[str] = None
+    priority: Optional[str] = Field(default=None, pattern="^(low|medium|high)$")
+
+    @field_validator("starts_at", "ends_at")
+    @classmethod
+    def normalize_event_datetime(cls, value: datetime | None) -> datetime | None:
+        return database_datetime(value)
 
 
 class EventResponse(ORMModel):
@@ -128,10 +201,12 @@ class EventResponse(ORMModel):
     ends_at: Optional[datetime]
     event_type: str
     color: str
+    priority: str
 
 
 class SessionCreate(BaseModel):
     user_id: int
+    task_id: Optional[int] = None
     duration_minutes: int = Field(ge=1, le=1440)
     focus_type: str = "focus"
 
@@ -139,6 +214,7 @@ class SessionCreate(BaseModel):
 class SessionResponse(ORMModel):
     id: int
     user_id: int
+    task_id: Optional[int]
     duration_minutes: int
     focus_type: str
     completed_at: datetime
@@ -226,14 +302,50 @@ class ConceptResponse(ORMModel):
     category: str
 
 
-class AssistantMessageCreate(BaseModel):
+class ConceptRelationshipCreate(BaseModel):
+    user_id: int = Field(gt=0)
+    source_id: int = Field(gt=0)
+    target_id: int = Field(gt=0)
+    relationship_type: str = Field(default="related_to", min_length=2, max_length=80)
+
+
+class AssistantConversationCreate(BaseModel):
+    user_id: int = Field(gt=0)
+    title: str = Field(default="New study chat", min_length=1, max_length=160)
+
+
+class AssistantConversationUpdate(BaseModel):
+    user_id: int = Field(gt=0)
+    title: str = Field(min_length=1, max_length=160)
+
+
+class AssistantConversationResponse(ORMModel):
+    id: int
     user_id: int
+    title: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class AssistantMessageCreate(BaseModel):
+    user_id: int = Field(gt=0)
     content: str = Field(min_length=1, max_length=5000)
+    conversation_id: Optional[int] = Field(default=None, gt=0)
+    document_ids: list[int] = Field(default_factory=list, max_length=8)
+    subject: Optional[str] = Field(default=None, max_length=120)
+    mode: Optional[str] = Field(default=None, max_length=40)
 
 
 class AssistantMessageResponse(ORMModel):
     id: int
     user_id: int
+    conversation_id: Optional[int]
     role: str
     content: str
+    context_items: list[dict[str, Any]] = Field(default_factory=list)
     created_at: datetime
+
+
+class AssistantActionRequest(BaseModel):
+    user_id: int = Field(gt=0)
+    assistant_message_id: int = Field(gt=0)

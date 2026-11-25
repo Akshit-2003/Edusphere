@@ -22,10 +22,13 @@ export interface NavProps {
 }
 
 export interface Classroom {
-  id: number;
-  name: string;
-  section: string | null;
-  teacher_id: number;
+  id: number
+  name: string
+  section: string | null
+  owner_id: number
+  class_code: string
+  membership_role: 'owner' | 'student'
+  member_count: number
 }
 
 export interface CurrentUser {
@@ -57,6 +60,7 @@ export interface CalendarEvent {
   ends_at: string | null
   event_type: string
   color: string
+  priority: 'low' | 'medium' | 'high'
 }
 
 export interface StudyDocument {

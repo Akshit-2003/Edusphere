@@ -1,15 +1,21 @@
 import json
+import re
+from io import BytesIO
+from pathlib import Path
+from collections import Counter
 from datetime import date, datetime, timedelta
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from pypdf import PdfReader
 from sqlalchemy import delete, func, or_
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from app.core.database import get_db
 from app.models.user import User
-from app.models.study import (AssistantMessage, CalendarEvent, ClassroomChannel, ClassroomMessage, Concept,
-    Document, DocumentShare, Flashcard, Quiz, QuizAttempt, StudySession, StudyTask, UserProfile)
-from app.schemas.study import (AssistantMessageCreate, AssistantMessageResponse, ChannelCreate, ChannelResponse, ConceptCreate, ConceptResponse,
-    DocumentCreate, DocumentResponse, DocumentShareCreate, DocumentShareResponse, DocumentUpdate, EventCreate, EventResponse,
+from app.models.study import (AssistantConversation, AssistantMessage, CalendarEvent, ClassroomChannel, ClassroomMessage, Concept, ConceptRelationship,
+    Document, DocumentPresence, DocumentShare, Flashcard, Quiz, QuizAttempt, StudySession, StudyTask, UserProfile)
+from app.schemas.study import (AssistantActionRequest, AssistantConversationCreate, AssistantConversationResponse, AssistantConversationUpdate, AssistantMessageCreate, AssistantMessageResponse, ChannelCreate, ChannelResponse, ConceptCreate, ConceptRelationshipCreate, ConceptResponse,
+    DocumentCollaboratorResponse, DocumentCreate, DocumentPresenceUpdate, DocumentResponse, DocumentShareCreate, DocumentShareResponse, DocumentUpdate, EventCreate, EventResponse, EventUpdate,
     FlashcardCreate, FlashcardResponse, FlashcardReview, MessageCreate, MessageResponse,
     ProfileResponse, ProfileUpdate, QuizAttemptCreate, QuizCreate, QuizResponse, SessionCreate,
     SessionResponse, TaskCreate, TaskResponse, TaskUpdate)
@@ -30,7 +36,7 @@ async def get_profile(user_id: int, db: AsyncSession = Depends(get_db)):
     user = await get_user_or_404(user_id, db)
     result = await db.execute(select(UserProfile).where(UserProfile.user_id == user_id))
     profile = result.scalars().first()
-    return ProfileResponse(user_id=user.id, full_name=user.full_name, email=user.email,
+    return ProfileResponse(user_id=user.id, full_name=user.full_name, email=user.email, email_verified=user.email_verified,
                            bio=profile.bio if profile else None,
                            daily_goal_hours=profile.daily_goal_hours if profile else 2,
                            department=profile.department if profile else None,
@@ -48,6 +54,20 @@ async def update_profile(user_id: int, payload: ProfileUpdate, db: AsyncSession 
     user = await get_user_or_404(user_id, db)
     if payload.full_name is not None:
         user.full_name = payload.full_name
+    if payload.email is not None and payload.email != user.email:
+        existing_email = (await db.execute(
+            select(User).where(func.lower(User.email) == payload.email.lower(), User.id != user_id)
+        )).scalars().first()
+        if existing_email:
+            raise HTTPException(status_code=409, detail='An account with this email already exists.')
+        # A changed address must be verified again before it can be used for a
+        # future sign-in. Any OTP for the old address is invalidated here.
+        user.email = payload.email
+        user.email_verified = False
+        user.verification_otp_hash = None
+        user.verification_otp_expiry = None
+        user.verification_otp_sent_at = None
+        user.verification_otp_attempts = 0
     result = await db.execute(select(UserProfile).where(UserProfile.user_id == user_id))
     profile = result.scalars().first()
     if not profile:
@@ -69,13 +89,142 @@ async def update_profile(user_id: int, payload: ProfileUpdate, db: AsyncSession 
     return await get_profile(user_id, db)
 
 
-@router.get('/assistant/messages/', response_model=list[AssistantMessageResponse])
-async def list_assistant_messages(user_id: int, db: AsyncSession = Depends(get_db)):
+def assistant_context_items(documents: list[Document]) -> list[dict[str, object]]:
+    """Return small, safe context descriptors stored with each chat message."""
+    return [
+        {
+            'document_id': document.id,
+            'title': document.title,
+            'kind': 'PDF' if document.folder.lower() == 'pdf imports' else 'Note',
+        }
+        for document in documents
+    ]
+
+
+def study_sentences(text: str, limit: int = 5) -> list[str]:
+    compact = re.sub(r'\s+', ' ', text).strip()
+    return [
+        sentence.strip()
+        for sentence in re.split(r'(?<=[.!?])\s+', compact)
+        if len(sentence.strip()) >= 30
+    ][:limit]
+
+
+def assistant_reply(prompt: str, documents: list[Document], subject: str | None, mode: str | None) -> str:
+    """Produce a useful, source-grounded study response without inventing private note content.
+
+    The assistant deliberately quotes its selected workspace context in short,
+    reviewable chunks. A hosted model can later replace this deterministic
+    generator while preserving the same persisted conversation contract.
+    """
+    topic = (subject or '').strip() or (documents[0].title if documents else 'this topic')
+    source_titles = ', '.join(document.title for document in documents)
+    excerpts = [sentence for document in documents for sentence in study_sentences(document.content, limit=4)]
+    if not excerpts:
+        excerpts = study_sentences(prompt, limit=3)
+
+    evidence = '\n'.join(f'- {sentence}' for sentence in excerpts[:4])
+    context_line = f"Based on your selected material: **{source_titles}**." if source_titles else 'No workspace source was selected, so this is a focused study scaffold.'
+    normalized_mode = (mode or '').lower()
+
+    if normalized_mode == 'summary':
+        return f"## Summary — {topic}\n\n{context_line}\n\n### Main takeaways\n{evidence or '- Start by identifying the definition, process, and examples for this topic.'}\n\n### Review next\n1. Restate each takeaway in your own words.\n2. Link it to one worked example.\n3. Test yourself without looking at the source."
+    if normalized_mode == 'explain':
+        return f"## Step-by-step explanation — {topic}\n\n{context_line}\n\n1. **Start with the core idea.** Define {topic} in one sentence.\n2. **Break it into parts.** Identify the terms, sequence, or components in your material.\n3. **Connect cause and effect.** Ask what changes when each part is applied.\n4. **Check with an example.** Explain one example aloud without reading.\n\n### Evidence from your material\n{evidence or '- Add a note or PDF as context for source-specific examples.'}"
+    if normalized_mode == 'flashcards':
+        return f"## Flashcard set — {topic}\n\n{context_line}\n\n{evidence or '- Add a workspace note to generate source-grounded cards.'}\n\nUse **Create flashcards** below to save revision cards directly to your deck."
+    if normalized_mode == 'quiz':
+        return f"## Practice plan — {topic}\n\n{context_line}\n\n### Test yourself\n1. What is the central definition or purpose?\n2. Which steps or components must appear in order?\n3. What is a realistic example or exception?\n\n### Study evidence\n{evidence or '- Select a note or PDF, then generate a practice quiz from it.'}\n\nUse **Create quiz** below to add a self-test to Quiz practice."
+    if normalized_mode == 'roadmap':
+        return f"## Study roadmap — {topic}\n\n{context_line}\n\n1. **Understand:** Read the source once and write a one-sentence definition.\n2. **Practice:** Turn the key ideas into active-recall questions.\n3. **Review:** Revisit the weak points after a focused session.\n\n### Priority material\n{evidence or '- Attach course material so the roadmap can be tied to your notes.'}\n\nUse **Create roadmap tasks** below to add this plan to your Study Planner."
+
+    return f"## Study help — {topic}\n\n{context_line}\n\n### A focused answer\nYour question: *{prompt.strip()}*\n\n{evidence or 'Start by selecting a workspace note, imported PDF, or a subject. I will use it as study context for your next question.'}\n\n### Best next step\nTurn the points above into retrieval questions, then use a short focus session to practise recalling them without reopening the source."
+
+
+async def get_assistant_conversation_or_404(conversation_id: int, user_id: int, db: AsyncSession) -> AssistantConversation:
+    conversation = await db.get(AssistantConversation, conversation_id)
+    if not conversation or conversation.user_id != user_id:
+        raise HTTPException(status_code=404, detail='Study chat not found.')
+    return conversation
+
+
+async def move_legacy_assistant_messages(user_id: int, db: AsyncSession) -> None:
+    """Keep the original single chat visible after the session migration."""
+    legacy = (await db.execute(
+        select(AssistantMessage.id)
+        .where(AssistantMessage.user_id == user_id, AssistantMessage.conversation_id.is_(None))
+        .limit(1)
+    )).scalar_one_or_none()
+    if legacy is None:
+        return
+    conversation = AssistantConversation(user_id=user_id, title='Earlier study chat')
+    db.add(conversation)
+    await db.flush()
+    await db.execute(
+        AssistantMessage.__table__.update()
+        .where(AssistantMessage.user_id == user_id, AssistantMessage.conversation_id.is_(None))
+        .values(conversation_id=conversation.id)
+    )
+
+
+@router.get('/assistant/conversations/', response_model=list[AssistantConversationResponse])
+async def list_assistant_conversations(user_id: int, db: AsyncSession = Depends(get_db)):
     await get_user_or_404(user_id, db)
+    await move_legacy_assistant_messages(user_id, db)
+    await db.commit()
+    result = await db.execute(
+        select(AssistantConversation)
+        .where(AssistantConversation.user_id == user_id)
+        .order_by(AssistantConversation.updated_at.desc())
+    )
+    return result.scalars().all()
+
+
+@router.post('/assistant/conversations/', response_model=AssistantConversationResponse, status_code=201)
+async def create_assistant_conversation(payload: AssistantConversationCreate, db: AsyncSession = Depends(get_db)):
+    await get_user_or_404(payload.user_id, db)
+    conversation = AssistantConversation(user_id=payload.user_id, title=payload.title.strip())
+    db.add(conversation)
+    await db.commit()
+    await db.refresh(conversation)
+    return conversation
+
+
+@router.patch('/assistant/conversations/{conversation_id}', response_model=AssistantConversationResponse)
+async def rename_assistant_conversation(conversation_id: int, payload: AssistantConversationUpdate, db: AsyncSession = Depends(get_db)):
+    conversation = await get_assistant_conversation_or_404(conversation_id, payload.user_id, db)
+    conversation.title = payload.title.strip()
+    conversation.updated_at = get_ist_time()
+    await db.commit()
+    await db.refresh(conversation)
+    return conversation
+
+
+@router.delete('/assistant/conversations/{conversation_id}', status_code=204)
+async def delete_assistant_conversation(conversation_id: int, user_id: int, db: AsyncSession = Depends(get_db)):
+    conversation = await get_assistant_conversation_or_404(conversation_id, user_id, db)
+    await db.execute(delete(AssistantMessage).where(AssistantMessage.conversation_id == conversation.id))
+    await db.delete(conversation)
+    await db.commit()
+
+
+@router.get('/assistant/conversations/{conversation_id}/messages/', response_model=list[AssistantMessageResponse])
+async def list_conversation_messages(conversation_id: int, user_id: int, db: AsyncSession = Depends(get_db)):
+    await get_assistant_conversation_or_404(conversation_id, user_id, db)
     result = await db.execute(
         select(AssistantMessage)
-        .where(AssistantMessage.user_id == user_id)
+        .where(AssistantMessage.user_id == user_id, AssistantMessage.conversation_id == conversation_id)
         .order_by(AssistantMessage.created_at)
+    )
+    return result.scalars().all()
+
+
+@router.get('/assistant/messages/', response_model=list[AssistantMessageResponse], include_in_schema=False)
+async def list_assistant_messages(user_id: int, db: AsyncSession = Depends(get_db)):
+    """Compatibility endpoint for earlier clients; new clients use conversations."""
+    await get_user_or_404(user_id, db)
+    result = await db.execute(
+        select(AssistantMessage).where(AssistantMessage.user_id == user_id).order_by(AssistantMessage.created_at)
     )
     return result.scalars().all()
 
@@ -83,27 +232,243 @@ async def list_assistant_messages(user_id: int, db: AsyncSession = Depends(get_d
 @router.post('/assistant/messages/')
 async def create_assistant_message(payload: AssistantMessageCreate, db: AsyncSession = Depends(get_db)):
     await get_user_or_404(payload.user_id, db)
-    message = AssistantMessage(user_id=payload.user_id, role='user', content=payload.content.strip())
-    db.add(message)
-    await db.flush()
+    conversation = None
+    if payload.conversation_id:
+        conversation = await get_assistant_conversation_or_404(payload.conversation_id, payload.user_id, db)
+    else:
+        conversation = AssistantConversation(user_id=payload.user_id, title=payload.content.strip()[:56] or 'New study chat')
+        db.add(conversation)
+        await db.flush()
 
-    document_count = (await db.execute(
-        select(func.count(Document.id)).where(Document.owner_id == payload.user_id)
-    )).scalar_one()
+    document_ids = list(dict.fromkeys(payload.document_ids))
+    documents: list[Document] = []
+    if document_ids:
+        result = await db.execute(select(Document).where(Document.owner_id == payload.user_id, Document.id.in_(document_ids)))
+        documents = result.scalars().all()
+        if len(documents) != len(document_ids):
+            raise HTTPException(status_code=404, detail='One or more selected workspace sources were not found.')
+
+    context_items = assistant_context_items(documents)
+    message = AssistantMessage(
+        user_id=payload.user_id,
+        conversation_id=conversation.id,
+        role='user',
+        content=payload.content.strip(),
+        context_items=context_items,
+    )
+    db.add(message)
     reply = AssistantMessage(
         user_id=payload.user_id,
+        conversation_id=conversation.id,
         role='assistant',
-        content=(
-            f"I saved your question to this study session. You currently have {document_count} "
-            f"document{'s' if document_count != 1 else ''} in your workspace. "
-            "Use your notes, flashcards, and planner together to turn this into a focused study task."
-        ),
+        content=assistant_reply(payload.content, documents, payload.subject, payload.mode),
+        context_items=context_items,
     )
+    conversation.updated_at = get_ist_time()
+    if conversation.title == 'New study chat':
+        conversation.title = payload.content.strip()[:56] or conversation.title
     db.add(reply)
     await db.commit()
     await db.refresh(message)
     await db.refresh(reply)
-    return {'user_message': message, 'assistant_message': reply}
+    await db.refresh(conversation)
+    return {'conversation': conversation, 'user_message': message, 'assistant_message': reply}
+
+
+async def get_assistant_reply_for_action(payload: AssistantActionRequest, db: AsyncSession) -> AssistantMessage:
+    await get_user_or_404(payload.user_id, db)
+    message = await db.get(AssistantMessage, payload.assistant_message_id)
+    if not message or message.user_id != payload.user_id or message.role != 'assistant':
+        raise HTTPException(status_code=404, detail='The selected assistant response was not found.')
+    return message
+
+
+def action_subject(message: AssistantMessage) -> str:
+    items = message.context_items or []
+    first = items[0] if items else {}
+    return str(first.get('title') or 'AI study session')[:120]
+
+
+@router.post('/assistant/actions/flashcards')
+async def create_flashcards_from_assistant(payload: AssistantActionRequest, db: AsyncSession = Depends(get_db)):
+    message = await get_assistant_reply_for_action(payload, db)
+    sentences = study_sentences(message.content, limit=5) or [message.content[:360]]
+    subject = action_subject(message)
+    cards = []
+    for index, sentence in enumerate(sentences, start=1):
+        card = Flashcard(
+            user_id=payload.user_id,
+            front=f'{subject}: key idea {index}',
+            back=sentence,
+            subject=subject,
+        )
+        db.add(card)
+        cards.append(card)
+    await db.commit()
+    return {'message': f'{len(cards)} flashcards added to your revision deck.', 'created_count': len(cards)}
+
+
+@router.post('/assistant/actions/quiz')
+async def create_quiz_from_assistant(payload: AssistantActionRequest, db: AsyncSession = Depends(get_db)):
+    message = await get_assistant_reply_for_action(payload, db)
+    subject = action_subject(message)
+    facts = study_sentences(message.content, limit=5) or [message.content[:220]]
+    questions = []
+    distractors = ['A detail not supported by the selected material', 'An unrelated study strategy', 'A term from a different topic']
+    for index, fact in enumerate(facts, start=1):
+        correct_index = index % 4
+        options = distractors.copy()
+        options.insert(correct_index, fact)
+        questions.append({
+            'q': f'Which statement best matches key point {index} from {subject}?',
+            'opts': options,
+            'correct': correct_index,
+        })
+    quiz = Quiz(user_id=payload.user_id, title=f'{subject} — AI practice quiz', subject=subject, questions=questions)
+    db.add(quiz)
+    await db.commit()
+    await db.refresh(quiz)
+    return {'message': 'Practice quiz created and ready in Quiz practice.', 'quiz_id': quiz.id, 'question_count': len(questions)}
+
+
+@router.post('/assistant/actions/roadmap')
+async def create_roadmap_from_assistant(payload: AssistantActionRequest, db: AsyncSession = Depends(get_db)):
+    message = await get_assistant_reply_for_action(payload, db)
+    subject = action_subject(message)
+    evidence = study_sentences(message.content, limit=3)
+    titles = [
+        f'Understand {subject}',
+        f'Practise active recall for {subject}',
+        f'Review and self-test {subject}',
+    ]
+    tasks = []
+    for index, title in enumerate(titles):
+        task = StudyTask(
+            user_id=payload.user_id,
+            title=title[:250],
+            description=evidence[index] if index < len(evidence) else 'Created from your AI study roadmap.',
+            subject=subject,
+            priority='medium',
+            status='todo',
+            estimate_minutes=30,
+        )
+        db.add(task)
+        tasks.append(task)
+    await db.commit()
+    return {'message': f'{len(tasks)} roadmap tasks added to your Study Planner.', 'created_count': len(tasks)}
+
+
+@router.post('/assistant/actions/note')
+async def save_assistant_response_as_note(payload: AssistantActionRequest, db: AsyncSession = Depends(get_db)):
+    message = await get_assistant_reply_for_action(payload, db)
+    subject = action_subject(message)
+    note = Document(
+        owner_id=payload.user_id,
+        title=f'AI notes — {subject}'[:250],
+        content=f'# AI study notes — {subject}\n\n{message.content}',
+        folder='AI Notes',
+    )
+    db.add(note)
+    await db.commit()
+    await db.refresh(note)
+    return {'message': 'Explanation saved to your workspace notes.', 'document_id': note.id, 'title': note.title}
+
+
+MAX_PDF_IMPORT_BYTES = 15 * 1024 * 1024
+PDF_STOP_WORDS = {'about', 'after', 'also', 'and', 'are', 'been', 'being', 'between', 'can', 'chapter', 'document', 'each', 'for', 'from', 'have', 'into', 'more', 'not', 'of', 'on', 'or', 'that', 'the', 'their', 'there', 'these', 'this', 'through', 'using', 'was', 'were', 'with', 'your'}
+
+
+def compact_pdf_summary(text: str) -> str:
+    sentences = [sentence.strip() for sentence in re.split(r'(?<=[.!?])\s+', text) if len(sentence.strip()) > 30]
+    summary = ' '.join(sentences[:4])
+    return summary[:900].rstrip() or 'The PDF was imported successfully. Open the workspace note to review its extracted content.'
+
+
+def extract_pdf_concepts(text: str) -> list[str]:
+    words = [word.lower() for word in re.findall(r"[A-Za-z][A-Za-z-]{3,}", text)]
+    counts = Counter(word for word in words if word not in PDF_STOP_WORDS)
+    return [word.title() for word, _ in counts.most_common(6)]
+
+
+@router.post('/pdf/import')
+async def import_pdf(
+    user_id: int = Form(...),
+    file: UploadFile = File(...),
+    generate_summary: bool = Form(True),
+    generate_flashcards: bool = Form(False),
+    save_as_note: bool = Form(True),
+    db: AsyncSession = Depends(get_db),
+):
+    """Validate, parse, and turn a PDF into user-scoped study material."""
+    await get_user_or_404(user_id, db)
+    filename = file.filename or 'Imported PDF.pdf'
+    if not filename.lower().endswith('.pdf') or file.content_type not in {None, '', 'application/pdf', 'application/octet-stream'}:
+        raise HTTPException(status_code=415, detail='Please upload a valid PDF file.')
+    content = await file.read(MAX_PDF_IMPORT_BYTES + 1)
+    if not content:
+        raise HTTPException(status_code=422, detail='The selected PDF is empty.')
+    if len(content) > MAX_PDF_IMPORT_BYTES:
+        raise HTTPException(status_code=413, detail='Choose a PDF smaller than 15 MB.')
+    if not content.startswith(b'%PDF-'):
+        raise HTTPException(status_code=415, detail='This file does not have a valid PDF signature.')
+    try:
+        reader = PdfReader(BytesIO(content))
+        if len(reader.pages) > 120:
+            raise HTTPException(status_code=422, detail='Please import a PDF with 120 pages or fewer.')
+        extracted_text = '\n\n'.join((page.extract_text() or '').strip() for page in reader.pages).strip()
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status_code=422, detail='This PDF could not be read. It may be password-protected or image-only.') from error
+    if not extracted_text:
+        raise HTTPException(status_code=422, detail='No selectable text was found in this PDF. Try a text-based PDF.')
+
+    title = Path(filename).stem.strip() or 'Imported study document'
+    extracted_text = extracted_text[:80_000]
+    summary = compact_pdf_summary(extracted_text) if generate_summary else ''
+    concepts = extract_pdf_concepts(extracted_text)
+    document = None
+    if save_as_note:
+        note_sections = [f'# {title}', f'Imported from {filename}']
+        if summary:
+            note_sections.extend(['## AI Summary', summary])
+        if concepts:
+            note_sections.extend(['## Key Concepts', ', '.join(concepts)])
+        note_sections.extend(['## Extracted Content', extracted_text])
+        document = Document(owner_id=user_id, title=title, content='\n\n'.join(note_sections), folder='PDF Imports')
+        db.add(document)
+        await db.flush()
+
+    created_flashcards = []
+    if generate_flashcards:
+        source_sentences = [sentence.strip() for sentence in re.split(r'(?<=[.!?])\s+', extracted_text) if 30 <= len(sentence.strip()) <= 360]
+        for index, sentence in enumerate(source_sentences[:5], start=1):
+            card = Flashcard(
+                user_id=user_id,
+                document_id=document.id if document else None,
+                front=f'Key point {index}: what should you remember from {title}?',
+                back=sentence,
+                subject=concepts[0] if concepts else 'PDF Import',
+            )
+            db.add(card)
+            created_flashcards.append(card)
+    for concept_name in concepts[:4]:
+        existing = (await db.execute(select(Concept).where(Concept.user_id == user_id, func.lower(Concept.name) == concept_name.lower()))).scalars().first()
+        if not existing:
+            db.add(Concept(user_id=user_id, name=concept_name, description=f'Imported from {title}', category='PDF Import'))
+    await db.commit()
+    if document:
+        await db.refresh(document)
+    return {
+        'document_id': document.id if document else None,
+        'document_title': document.title if document else title,
+        'page_count': len(reader.pages),
+        'extracted_characters': len(extracted_text),
+        'summary': summary,
+        'key_concepts': concepts,
+        'flashcards_created': len(created_flashcards),
+        'preview': extracted_text[:700],
+    }
 
 
 @router.get('/documents/', response_model=list[DocumentResponse])
@@ -152,6 +517,7 @@ async def delete_document(document_id: int, db: AsyncSession = Depends(get_db)):
     if not document:
         raise HTTPException(status_code=404, detail='Document not found.')
     await db.execute(delete(DocumentShare).where(DocumentShare.document_id == document_id))
+    await db.execute(delete(DocumentPresence).where(DocumentPresence.document_id == document_id))
     await db.delete(document)
     await db.commit()
 
@@ -201,6 +567,98 @@ async def delete_document_share(document_id: int, share_id: int, db: AsyncSessio
     await db.commit()
 
 
+PRESENCE_TTL = timedelta(seconds=12)
+
+
+@router.put('/documents/{document_id}/presence', status_code=204)
+async def update_document_presence(document_id: int, payload: DocumentPresenceUpdate, db: AsyncSession = Depends(get_db)):
+    """Record one browser session's current document presence and edit state."""
+    document = await db.get(Document, document_id)
+    if not document:
+        raise HTTPException(status_code=404, detail='Document not found.')
+    await get_user_or_404(payload.user_id, db)
+
+    now = get_ist_time()
+    # Heartbeats can overlap when a user starts typing as an interval tick is
+    # in flight. PostgreSQL's upsert keeps that normal browser behavior safe.
+    heartbeat = pg_insert(DocumentPresence).values(
+        document_id=document_id,
+        user_id=payload.user_id,
+        session_id=payload.session_id,
+        is_editing=payload.is_editing,
+        last_active_at=now,
+    ).on_conflict_do_update(
+        constraint='uq_document_presence_session',
+        set_={'is_editing': payload.is_editing, 'last_active_at': now},
+    )
+    await db.execute(heartbeat)
+    await db.commit()
+
+
+@router.get('/documents/{document_id}/collaborators', response_model=list[DocumentCollaboratorResponse])
+async def list_document_collaborators(document_id: int, db: AsyncSession = Depends(get_db)):
+    """Return users whose document session heartbeat is still active."""
+    document = await db.get(Document, document_id)
+    if not document:
+        raise HTTPException(status_code=404, detail='Document not found.')
+
+    active_since = get_ist_time() - PRESENCE_TTL
+    await db.execute(
+        delete(DocumentPresence).where(
+            DocumentPresence.document_id == document_id,
+            DocumentPresence.last_active_at < active_since,
+        )
+    )
+    await db.commit()
+
+    result = await db.execute(
+        select(DocumentPresence, User, UserProfile)
+        .join(User, User.id == DocumentPresence.user_id)
+        .outerjoin(UserProfile, UserProfile.user_id == User.id)
+        .where(
+            DocumentPresence.document_id == document_id,
+            DocumentPresence.last_active_at >= active_since,
+        )
+        .order_by(DocumentPresence.last_active_at.desc())
+    )
+
+    # A user can have the same document open in more than one tab. The header
+    # represents that person once, while preserving an editing status if any
+    # of their live sessions is editing.
+    active_users: dict[int, DocumentCollaboratorResponse] = {}
+    for presence, user, profile in result.all():
+        current = active_users.get(user.id)
+        if current:
+            current.is_editing = current.is_editing or presence.is_editing
+            continue
+        active_users[user.id] = DocumentCollaboratorResponse(
+            user_id=user.id,
+            full_name=user.full_name,
+            avatar_url=profile.avatar_url if profile else None,
+            is_editing=presence.is_editing,
+            last_active_at=presence.last_active_at,
+        )
+    return list(active_users.values())
+
+
+@router.delete('/documents/{document_id}/presence', status_code=204)
+async def leave_document_presence(
+    document_id: int,
+    user_id: int = Query(gt=0),
+    session_id: str = Query(min_length=8, max_length=80),
+    db: AsyncSession = Depends(get_db),
+):
+    """Remove only the closing browser session; other tabs remain active."""
+    await db.execute(
+        delete(DocumentPresence).where(
+            DocumentPresence.document_id == document_id,
+            DocumentPresence.user_id == user_id,
+            DocumentPresence.session_id == session_id,
+        )
+    )
+    await db.commit()
+
+
 @router.get('/study-tasks/', response_model=list[TaskResponse])
 async def list_study_tasks(user_id: int, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(StudyTask).where(StudyTask.user_id == user_id).order_by(StudyTask.created_at.desc()))
@@ -238,13 +696,15 @@ async def delete_study_task(task_id: int, db: AsyncSession = Depends(get_db)):
     await db.commit()
 
 
-@router.get('/events/', response_model=list[EventResponse])
+@router.get('/calendar-events/', response_model=list[EventResponse])
+@router.get('/events/', response_model=list[EventResponse], include_in_schema=False)
 async def list_events(user_id: int, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(CalendarEvent).where(CalendarEvent.user_id == user_id).order_by(CalendarEvent.starts_at))
     return result.scalars().all()
 
 
-@router.post('/events/', response_model=EventResponse, status_code=201)
+@router.post('/calendar-events/', response_model=EventResponse, status_code=201)
+@router.post('/events/', response_model=EventResponse, status_code=201, include_in_schema=False)
 async def create_event(payload: EventCreate, db: AsyncSession = Depends(get_db)):
     await get_user_or_404(payload.user_id, db)
     event = CalendarEvent(**payload.model_dump())
@@ -252,6 +712,29 @@ async def create_event(payload: EventCreate, db: AsyncSession = Depends(get_db))
     await db.commit()
     await db.refresh(event)
     return event
+
+
+@router.put('/calendar-events/{event_id}', response_model=EventResponse)
+@router.put('/events/{event_id}', response_model=EventResponse, include_in_schema=False)
+async def update_event(event_id: int, payload: EventUpdate, db: AsyncSession = Depends(get_db)):
+    event = await db.get(CalendarEvent, event_id)
+    if not event:
+        raise HTTPException(status_code=404, detail='Calendar event not found.')
+    for field, value in payload.model_dump(exclude_unset=True).items():
+        setattr(event, field, value)
+    await db.commit()
+    await db.refresh(event)
+    return event
+
+
+@router.delete('/calendar-events/{event_id}', status_code=204)
+@router.delete('/events/{event_id}', status_code=204, include_in_schema=False)
+async def delete_event(event_id: int, db: AsyncSession = Depends(get_db)):
+    event = await db.get(CalendarEvent, event_id)
+    if not event:
+        raise HTTPException(status_code=404, detail='Calendar event not found.')
+    await db.delete(event)
+    await db.commit()
 
 
 @router.get('/sessions/', response_model=list[SessionResponse])
@@ -263,6 +746,10 @@ async def list_sessions(user_id: int, db: AsyncSession = Depends(get_db)):
 @router.post('/sessions/', response_model=SessionResponse, status_code=201)
 async def create_session(payload: SessionCreate, db: AsyncSession = Depends(get_db)):
     await get_user_or_404(payload.user_id, db)
+    if payload.task_id is not None:
+        task = await db.get(StudyTask, payload.task_id)
+        if not task or task.user_id != payload.user_id:
+            raise HTTPException(status_code=404, detail='The selected study task was not found.')
     session = StudySession(**payload.model_dump())
     db.add(session)
     await db.commit()
@@ -371,6 +858,116 @@ async def create_concept(payload: ConceptCreate, db: AsyncSession = Depends(get_
     await db.commit()
     await db.refresh(concept)
     return concept
+
+
+@router.get('/knowledge-graph/')
+async def get_knowledge_graph(user_id: int, db: AsyncSession = Depends(get_db)):
+    """Return a user-scoped concept graph with real study artefact links."""
+    await get_user_or_404(user_id, db)
+    concepts = (await db.execute(select(Concept).where(Concept.user_id == user_id).order_by(Concept.name))).scalars().all()
+    concept_ids = [concept.id for concept in concepts]
+    if not concept_ids:
+        return {'nodes': [], 'edges': [], 'categories': []}
+
+    relationships = (await db.execute(
+        select(ConceptRelationship).where(
+            ConceptRelationship.source_id.in_(concept_ids),
+            ConceptRelationship.target_id.in_(concept_ids),
+        )
+    )).scalars().all()
+    documents = (await db.execute(select(Document).where(Document.owner_id == user_id))).scalars().all()
+    flashcards = (await db.execute(select(Flashcard).where(Flashcard.user_id == user_id))).scalars().all()
+    tasks = (await db.execute(select(StudyTask).where(StudyTask.user_id == user_id))).scalars().all()
+
+    def matches_concept(text: str | None, name: str) -> bool:
+        return bool(text and name.lower() in text.lower())
+
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    seen_artifacts: set[str] = set()
+    for concept in concepts:
+        linked_notes = [
+            {'id': document.id, 'title': document.title}
+            for document in documents
+            if matches_concept(document.title, concept.name) or matches_concept(document.content, concept.name)
+        ]
+        linked_cards = [
+            {'id': card.id, 'front': card.front}
+            for card in flashcards
+            if matches_concept(card.front, concept.name) or matches_concept(card.back, concept.name) or matches_concept(card.subject, concept.name)
+        ]
+        linked_tasks = [
+            {'id': task.id, 'title': task.title, 'status': task.status}
+            for task in tasks
+            if matches_concept(task.title, concept.name) or matches_concept(task.description, concept.name) or matches_concept(task.subject, concept.name)
+        ]
+        completed_tasks = sum(task['status'] == 'done' for task in linked_tasks)
+        mastery = min(100, len(linked_notes) * 22 + len(linked_cards) * 10 + completed_tasks * 25)
+        concept_id = f'concept:{concept.id}'
+        nodes.append({
+            'id': concept_id,
+            'entity_id': concept.id,
+            'node_type': 'concept',
+            'label': concept.name,
+            'description': concept.description,
+            'category': concept.category,
+            'mastery': mastery,
+            'linked_notes': linked_notes,
+            'linked_flashcards': linked_cards,
+            'linked_tasks': linked_tasks,
+        })
+        for note in linked_notes:
+            artifact_id = f'note:{note["id"]}'
+            if artifact_id not in seen_artifacts:
+                seen_artifacts.add(artifact_id)
+                nodes.append({'id': artifact_id, 'entity_id': note['id'], 'node_type': 'note', 'label': note['title'], 'description': 'Workspace note', 'category': 'Notes', 'mastery': 0, 'linked_notes': [], 'linked_flashcards': [], 'linked_tasks': []})
+            edges.append({'id': f'{concept_id}-{artifact_id}', 'source': concept_id, 'target': artifact_id, 'relationship_type': 'note'})
+        for card in linked_cards:
+            artifact_id = f'flashcard:{card["id"]}'
+            if artifact_id not in seen_artifacts:
+                seen_artifacts.add(artifact_id)
+                nodes.append({'id': artifact_id, 'entity_id': card['id'], 'node_type': 'flashcard', 'label': card['front'], 'description': 'Linked flashcard', 'category': 'Flashcards', 'mastery': 0, 'linked_notes': [], 'linked_flashcards': [], 'linked_tasks': []})
+            edges.append({'id': f'{concept_id}-{artifact_id}', 'source': concept_id, 'target': artifact_id, 'relationship_type': 'flashcard'})
+        for task in linked_tasks:
+            artifact_id = f'task:{task["id"]}'
+            if artifact_id not in seen_artifacts:
+                seen_artifacts.add(artifact_id)
+                nodes.append({'id': artifact_id, 'entity_id': task['id'], 'node_type': 'task', 'label': task['title'], 'description': f"Task status: {task['status']}", 'category': 'Tasks', 'mastery': 0, 'linked_notes': [], 'linked_flashcards': [], 'linked_tasks': []})
+            edges.append({'id': f'{concept_id}-{artifact_id}', 'source': concept_id, 'target': artifact_id, 'relationship_type': 'task'})
+
+    edges.extend({
+        'id': f'concept:{relationship.source_id}-concept:{relationship.target_id}-{relationship.id}',
+        'source': f'concept:{relationship.source_id}',
+        'target': f'concept:{relationship.target_id}',
+        'relationship_type': relationship.relationship_type,
+    } for relationship in relationships)
+    return {'nodes': nodes, 'edges': edges, 'categories': sorted({node['category'] for node in nodes})}
+
+
+@router.post('/knowledge-graph/relationships', status_code=201)
+async def create_concept_relationship(payload: ConceptRelationshipCreate, db: AsyncSession = Depends(get_db)):
+    """Create an account-scoped connection between two concepts."""
+    if payload.source_id == payload.target_id:
+        raise HTTPException(status_code=422, detail='Choose two different concepts to create a connection.')
+    source = await db.get(Concept, payload.source_id)
+    target = await db.get(Concept, payload.target_id)
+    if not source or not target or source.user_id != payload.user_id or target.user_id != payload.user_id:
+        raise HTTPException(status_code=404, detail='Both concepts must belong to your account.')
+    relationship_type = payload.relationship_type.strip()
+    existing = (await db.execute(
+        select(ConceptRelationship).where(
+            ConceptRelationship.source_id == payload.source_id,
+            ConceptRelationship.target_id == payload.target_id,
+            ConceptRelationship.relationship_type == relationship_type,
+        )
+    )).scalars().first()
+    if existing:
+        return {'id': existing.id, 'source': existing.source_id, 'target': existing.target_id, 'relationship_type': existing.relationship_type}
+    relationship = ConceptRelationship(source_id=payload.source_id, target_id=payload.target_id, relationship_type=relationship_type)
+    db.add(relationship)
+    await db.commit()
+    await db.refresh(relationship)
+    return {'id': relationship.id, 'source': relationship.source_id, 'target': relationship.target_id, 'relationship_type': relationship.relationship_type}
 
 
 @router.get('/dashboard/{user_id}')
