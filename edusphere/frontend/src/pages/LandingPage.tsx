@@ -119,13 +119,7 @@ export default function LandingPage({ onLogin, onSignup }: Props) {
           }}
         >
           <div className="flex items-center gap-2.5 mr-10 cursor-pointer" onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}>
-            <div className="w-8 h-8 rounded-lg flex items-center justify-center shadow-md shadow-primary/20" style={{ background: 'var(--primary)' }}>
-              <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
-                <circle cx="9" cy="9" r="7" stroke="white" strokeWidth="1.5" />
-                <path d="M5 9h8M9 5v8" stroke="white" strokeWidth="1.5" strokeLinecap="round" />
-                <circle cx="9" cy="9" r="2" fill="white" />
-              </svg>
-            </div>
+            <img src="/edusphere-mark.svg" alt="EduSphere" className="h-8 w-8 shrink-0 drop-shadow-md" />
             <span className="font-heading font-bold text-base tracking-tight">EduSphere</span>
           </div>
 

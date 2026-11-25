@@ -69,13 +69,7 @@ export default function Sidebar({ page, setPage, open, onToggle, user }: Sidebar
     >
       {/* Logo */}
       <div className="flex items-center gap-3 px-4 h-14 shrink-0 border-b" style={{ borderColor: 'var(--border)' }}>
-        <div className="w-8 h-8 rounded-lg bg-primary flex items-center justify-center shrink-0">
-          <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
-            <circle cx="9" cy="9" r="7" stroke="white" strokeWidth="1.5" />
-            <path d="M5 9h8M9 5v8" stroke="white" strokeWidth="1.5" strokeLinecap="round" />
-            <circle cx="9" cy="9" r="2" fill="white" />
-          </svg>
-        </div>
+        <img src="/edusphere-mark.svg" alt="EduSphere" className="h-8 w-8 shrink-0 drop-shadow-sm" />
         {open && (
           <span className="font-heading font-800 text-base tracking-tight" style={{ color: 'var(--foreground)' }}>
             EduSphere
