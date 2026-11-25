@@ -1,7 +1,10 @@
 import axios from 'axios';
 
+const BASE_URL =
+  import.meta.env.VITE_API_URL || 'https://edusphere-backend-9it7.onrender.com';
+
 const API = axios.create({
-  baseURL: 'http://127.0.0.1:8000/api/v1', // Aapka FastAPI base URL
+  baseURL: BASE_URL,
   headers: {
     'Content-Type': 'application/json',
   },
@@ -13,6 +16,9 @@ export const forgotPassword = async (email) => {
 };
 
 export const resetPassword = async (token, newPassword) => {
-  const response = await API.post('/auth/reset-password', { token, new_password: newPassword });
+  const response = await API.post('/auth/reset-password', {
+    token,
+    new_password: newPassword,
+  });
   return response.data;
 };
