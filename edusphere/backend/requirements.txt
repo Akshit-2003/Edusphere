@@ -1,0 +1,21 @@
+# Web API and ASGI server
+fastapi==0.141.1
+uvicorn==0.52.3
+pydantic==2.13.4
+
+# Async PostgreSQL persistence
+SQLAlchemy==2.0.52
+asyncpg==0.31.0
+
+# Authentication, time zones, and environment configuration
+passlib==1.7.4
+bcrypt==3.2.2
+python-dotenv==1.2.2
+pytz==2026.3.post1
+
+# Multipart uploads and text-based PDF import
+python-multipart==0.0.33
+pypdf==6.21.4
+
+# The current source-grounded AI assistant uses internal application logic;
+# no external OpenAI, Gemini, or Anthropic SDK is imported by this backend.
